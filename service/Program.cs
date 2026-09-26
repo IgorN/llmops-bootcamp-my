@@ -169,8 +169,7 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpContext ct
         await using var audit = new NpgsqlCommand(
             "INSERT INTO prompt_activations (name, version, actor) VALUES ('support-system', @v, @actor)", db, tx);
         audit.Parameters.AddWithValue("v", version);
-        audit.Parameters.AddWithValue("actor",
-            (object?)ctx.Connection.RemoteIpAddress?.ToString() ?? DBNull.Value);
+        audit.Parameters.AddWithValue("actor", (object?)Actor(ctx) ?? DBNull.Value);
         await audit.ExecuteNonQueryAsync();
 
         await tx.CommitAsync();
@@ -188,6 +187,19 @@ app.MapGet("/providers", () => Results.Json(new { todo = "provider health" })); 
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
 app.Run("http://0.0.0.0:8080");
+
+// хто перемкнув версію. Беремо із заголовка X-Actor.
+// IP це запасний варіант і не ідентифікує людину, бо з хоста всі запити йдуть
+// від bridge, а з консолі від контейнера ui. Тому позначаємо його як ip:
+// і замінимо на перевірений ідентифікатор, коли зʼявиться автентифікація (W4).
+static string? Actor(HttpContext ctx)
+{
+    var header = ctx.Request.Headers["X-Actor"].ToString();
+    if (!string.IsNullOrWhiteSpace(header)) return header.Trim();
+
+    var ip = ctx.Connection.RemoteIpAddress?.ToString();
+    return ip is null ? null : $"ip:{ip}";
+}
 
 // дістає активний промпт і його версію з реєстру.
 // Порожній реєстр це не помилка, а стан. Віддаємо резервний промпт без маркера

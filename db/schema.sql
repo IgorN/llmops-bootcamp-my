@@ -22,6 +22,14 @@ CREATE TABLE IF NOT EXISTS prompts (
     PRIMARY KEY (name, version)
 );
 
+-- Рівно одна активна версія на промпт. Тримає схема, а не код.
+-- Частковий унікальний індекс тут не підійде, бо Postgres перевіряє його після
+-- кожного рядка і наш UPDATE впав би з duplicate key на середині перемикання.
+-- Відкладене обмеження перевіряється в кінці транзакції, коли стан уже коректний.
+ALTER TABLE prompts DROP CONSTRAINT IF EXISTS one_active;
+ALTER TABLE prompts ADD CONSTRAINT one_active
+    EXCLUDE (name WITH =) WHERE (active) DEFERRABLE INITIALLY DEFERRED;
+
 -- Журнал активацій. Хто, коли і яку версію зробив активною.
 -- Пишеться в одній транзакції з UPDATE prompts, щоб стан і історія не розходились.
 CREATE TABLE IF NOT EXISTS prompt_activations (
