@@ -24,8 +24,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory, ILogger
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+    // routing (W2): модель за тиром запиту. Тир пишемо в лог, щоб бачити частку трафіку.
+    var (model, tier) = Route(body.Message, defaultModel);
 
     // промпт (W1): активна версія з реєстру.
     // Недоступна БД не дорівнює порожньому реєстру. Без неї не буде ні промпта,
@@ -100,7 +100,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory, ILogger
     decimal? costUsd = null;  // TODO(student, W2)
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
+    await LogRequest(dbConn, requestId, model, tier, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
@@ -188,6 +188,36 @@ app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals
 
 app.Run("http://0.0.0.0:8080");
 
+// fallback chain: escalation mock-strong -> claude-opus-5-5 -> тікет на оператора; faq, standard mock-mini -> claude-haiku-4-5 -> контрольована помилка
+// Другий крок завжди інший провайдер. mock-mini і mock-strong живуть на одному
+// mock-provider і падають разом, тож перехід між ними від падіння не рятує.
+// Ескалацію не спускаємо на слабшу модель. Повернення і скарги краще віддати людині.
+static (string Model, string Tier) Route(string message, string defaultModel)
+{
+    var tier = Tier(message);
+
+    // MODEL не mock означає реальну модель. Її лишаємо як є, тир тільки пишемо в лог.
+    if (defaultModel != "mock") return (defaultModel, tier);
+
+    // faq поки йде на mock-mini. На W3 його підхопить кеш.
+    return (tier == "escalation" ? "mock-strong" : "mock-mini", tier);
+}
+
+// tier-політика. Ескалацію перевіряємо першою, бо вона сильніша за FAQ.
+// «поверніть гроші, не працює вхід» має піти на сильну модель.
+// Хибна ескалація коштує дорожчий виклик, пропущена коштує клієнта зі скаргою.
+// Тому маркери ескалації широкі, а FAQ вузький. Решта це standard.
+static string Tier(string message)
+{
+    var m = message.ToLowerInvariant();
+    string[] escalation = ["поверн", "терміново", "скарг", "refund", "urgent", "complain"];
+    string[] faq = ["пароль", "password", "вхід", "login"];
+
+    if (escalation.Any(m.Contains)) return "escalation";
+    if (faq.Any(m.Contains)) return "faq";
+    return "standard";
+}
+
 // хто перемкнув версію. Беремо із заголовка X-Actor.
 // IP це запасний варіант і не ідентифікує людину, бо з хоста всі запити йдуть
 // від bridge, а з консолі від контейнера ui. Тому позначаємо його як ip:
@@ -221,7 +251,7 @@ static async Task<(string Body, string Version)> GetActivePrompt(string conn)
 }
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
+static async Task LogRequest(string conn, Guid id, string model, string tier, string promptVersion, int latency,
     int promptTokens, int completionTokens, decimal? cost, int status)
 {
     try
@@ -229,10 +259,11 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @pv, @lat, @pt, @ct, @cost, @status)", db);
+            "INSERT INTO requests (request_id, model, tier, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
+            + "VALUES (@id, @model, @tier, @pv, @lat, @pt, @ct, @cost, @status)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
+        cmd.Parameters.AddWithValue("tier", tier);
         cmd.Parameters.AddWithValue("pv", promptVersion);
         cmd.Parameters.AddWithValue("lat", latency);
         cmd.Parameters.AddWithValue("pt", promptTokens);

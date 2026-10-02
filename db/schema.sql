@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS requests (
     request_id      UUID PRIMARY KEY,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     model           TEXT NOT NULL,
+    tier            TEXT,  -- faq / standard / escalation, клас запиту замість тексту повідомлення
     provider        TEXT,
     prompt_version  TEXT,
     latency_ms      INTEGER,
