@@ -16,15 +16,34 @@ var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 
-app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory, ILogger<Program> logger) =>
+// прайс (W2): USD за 1k токенів (in, out). Ціни це живі дані, тому для реальних моделей пишемо дату і джерело.
+// mock-ціни навчальні, але з реальними пропорціями. strong дорожча у ~16 разів, out у 4 рази дорожчий за in.
+// azure-gpt-5 навмисно немає. Ціна Azure залежить від типу deployment і регіону,
+// а deployment у конфігу поки заглушка. Для нього cost_usd буде null, а не нуль.
+var prices = new Dictionary<string, (decimal In, decimal Out)>
+{
+    ["mock-mini"] = (0.00015m, 0.0006m),
+    ["mock-strong"] = (0.0025m, 0.01m),
+    // OpenAI станом на 2026-10-04, developers.openai.com/api/docs/pricing ($/1M: mini 0.25/2, gpt-5 1.25/10)
+    ["gpt-5-mini"] = (0.00025m, 0.002m),
+    ["gpt-5"] = (0.00125m, 0.01m),
+    // Anthropic станом на 2026-10-04, platform.claude.com/docs/en/about-claude/pricing ($/1M: haiku 1/5, opus 4/20)
+    ["claude-haiku-4-5"] = (0.001m, 0.005m),
+    ["claude-opus-5-5"] = (0.004m, 0.02m),
+};
+var budgetUsd = 5.00m;  // денний бюджет
+var budgetAlertDay = DateOnly.MinValue;  // щоб алерт був раз на день, а не на кожен запит
+
+app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory httpFactory, ILogger<Program> logger) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
+    var source = Source(ctx);
 
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): модель за тиром запиту. Тир пишемо в лог, щоб бачити частку трафіку.
+    // routing (W2): модель за рівнем (tier) запиту. Рівень пишемо в лог, щоб бачити частку трафіку.
     var (model, tier) = Route(body.Message, defaultModel);
 
     // промпт (W1): активна версія з реєстру.
@@ -62,6 +81,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory, ILogger
     var answer = "";
     string? toolCall = null;
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
+    var usageKnown = false;  // без usage вартість невідома, і це null, а не нуль
     try
     {
         var response = await http.PostAsync(
@@ -86,6 +106,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory, ILogger
         var usage = doc.RootElement.GetProperty("usage");
         promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
         completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+        usageKnown = true;
     }
     catch
     {
@@ -96,11 +117,33 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory, ILogger
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    // cost (W2): порахувати tokens * ціна і покласти в cost_usd
-    decimal? costUsd = null;  // TODO(student, W2)
+    // cost (W2): usage з відповіді, ціна за моделлю з прайсу. Нема тарифу або usage, буде null.
+    // Нуль лишаємо для випадку, коли виклику справді не було (cache-hit з W3).
+    // Округлення до 6 знаків як у колонці NUMERIC(10, 6).
+    decimal? costUsd = usageKnown && prices.TryGetValue(model, out var price)
+        ? Math.Round(promptTokens / 1000m * price.In + completionTokens / 1000m * price.Out, 6)
+        : null;
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, tier, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
+    await LogRequest(dbConn, requestId, model, tier, source, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
+
+    // budget policy (W2): поріг 80% дає алерт у лог, див. рядок біля Route().
+    // Перевірка після логу, щоб у суму потрапив і цей запит. Падіння перевірки
+    // не валить відповідь користувачу, як і падіння логу.
+    try
+    {
+        var spent = await TodayCostUsd(dbConn);
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        if (spent >= budgetUsd * 0.8m && budgetAlertDay != today)
+        {
+            budgetAlertDay = today;
+            logger.LogWarning("budget alert: spent {Spent} of {Budget} USD today, 80% threshold reached", spent, budgetUsd);
+        }
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "budget check failed for request {RequestId}", requestId);
+    }
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
@@ -108,7 +151,20 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory, ILogger
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
+// W2: витрати за сьогодні з БД плюс бюджет. Без БД 503, а не нуль, бо нуль збреше плитці.
+app.MapGet("/cost", async (ILogger<Program> logger) =>
+{
+    try
+    {
+        return Results.Json(new { today_usd = await TodayCostUsd(dbConn), budget_usd = budgetUsd });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "failed to read today cost");
+        return Results.Json(new { error = "cost unavailable" },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+});
 // W1: усі версії промпта, не лише активна. Консоль показує, на що можна відкотитись.
 app.MapGet("/prompts", async (ILogger<Program> logger) =>
 {
@@ -192,11 +248,12 @@ app.Run("http://0.0.0.0:8080");
 // Другий крок завжди інший провайдер. mock-mini і mock-strong живуть на одному
 // mock-provider і падають разом, тож перехід між ними від падіння не рятує.
 // Ескалацію не спускаємо на слабшу модель. Повернення і скарги краще віддати людині.
+// budget policy: на 80% денного бюджету пишемо алерт у лог і маршрут не міняємо, бо faq і standard уже на найдешевшій моделі, а ескалацію свідомо не здешевлюємо.
 static (string Model, string Tier) Route(string message, string defaultModel)
 {
     var tier = Tier(message);
 
-    // MODEL не mock означає реальну модель. Її лишаємо як є, тир тільки пишемо в лог.
+    // MODEL не mock означає реальну модель. Її лишаємо як є, а tier тільки пишемо в лог.
     if (defaultModel != "mock") return (defaultModel, tier);
 
     // faq поки йде на mock-mini. На W3 його підхопить кеш.
@@ -210,13 +267,21 @@ static (string Model, string Tier) Route(string message, string defaultModel)
 static string Tier(string message)
 {
     var m = message.ToLowerInvariant();
-    string[] escalation = ["поверн", "терміново", "скарг", "refund", "urgent", "complain"];
+    string[] escalation = ["поверн", "терміново", "скарг", "refund", "money back", "chargeback", "urgent", "complain"];
     string[] faq = ["пароль", "password", "вхід", "login"];
 
     if (escalation.Any(m.Contains)) return "escalation";
     if (faq.Any(m.Contains)) return "faq";
     return "standard";
 }
+
+// звідки запит. Runner evals шле X-Source: eval, решта це клієнти.
+// Заголовок задає сам клієнт, тож це атрибуція витрат, а не захист.
+// Невідоме значення не валить запит і вважається user.
+static string Source(HttpContext ctx) =>
+    string.Equals(ctx.Request.Headers["X-Source"].ToString(), "eval", StringComparison.OrdinalIgnoreCase)
+        ? "eval"
+        : "user";
 
 // хто перемкнув версію. Беремо із заголовка X-Actor.
 // IP це запасний варіант і не ідентифікує людину, бо з хоста всі запити йдуть
@@ -229,6 +294,19 @@ static string? Actor(HttpContext ctx)
 
     var ip = ctx.Connection.RemoteIpAddress?.ToString();
     return ip is null ? null : $"ip:{ip}";
+}
+
+// витрати за сьогодні. Одна функція і для GET /cost, і для порогу бюджету, щоб не розійшлись.
+// Діапазон дає той самий день, що й created_at::date = CURRENT_DATE, але може взяти індекс.
+// SUM без рядків дає NULL, тому COALESCE до нуля. Тут нуль чесний, бо витрат не було.
+static async Task<decimal> TodayCostUsd(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM requests "
+        + "WHERE created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + 1", db);
+    return (decimal)(await cmd.ExecuteScalarAsync())!;
 }
 
 // дістає активний промпт і його версію з реєстру.
@@ -251,7 +329,7 @@ static async Task<(string Body, string Version)> GetActivePrompt(string conn)
 }
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, string tier, string promptVersion, int latency,
+static async Task LogRequest(string conn, Guid id, string model, string tier, string source, string promptVersion, int latency,
     int promptTokens, int completionTokens, decimal? cost, int status)
 {
     try
@@ -259,11 +337,12 @@ static async Task LogRequest(string conn, Guid id, string model, string tier, st
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, tier, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @tier, @pv, @lat, @pt, @ct, @cost, @status)", db);
+            "INSERT INTO requests (request_id, model, tier, source, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
+            + "VALUES (@id, @model, @tier, @source, @pv, @lat, @pt, @ct, @cost, @status)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
         cmd.Parameters.AddWithValue("tier", tier);
+        cmd.Parameters.AddWithValue("source", source);
         cmd.Parameters.AddWithValue("pv", promptVersion);
         cmd.Parameters.AddWithValue("lat", latency);
         cmd.Parameters.AddWithValue("pt", promptTokens);
