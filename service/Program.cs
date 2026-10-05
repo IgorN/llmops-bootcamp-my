@@ -127,22 +127,27 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, tier, source, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
-    // budget policy (W2): поріг 80% дає алерт у лог, див. рядок біля Route().
+    // budget policy (W2): поріг 80% за клієнтськими витратами дає алерт у лог, див. рядок біля Route().
+    // Перевіряємо лише після платного клієнтського виклику. Тільки він збільшує суму, тож
+    // evals, невдалі виклики і cache-hit з W3 не ходять у базу за сумою.
     // Перевірка після логу, щоб у суму потрапив і цей запит. Падіння перевірки
     // не валить відповідь користувачу, як і падіння логу.
-    try
+    if (source == "user" && costUsd > 0)
     {
-        var spent = await TodayCostUsd(dbConn);
-        var today = DateOnly.FromDateTime(DateTime.UtcNow);
-        if (spent >= budgetUsd * 0.8m && budgetAlertDay != today)
+        try
         {
-            budgetAlertDay = today;
-            logger.LogWarning("budget alert: spent {Spent} of {Budget} USD today, 80% threshold reached", spent, budgetUsd);
+            var spent = (await TodayCostUsd(dbConn)).User;
+            var today = DateOnly.FromDateTime(DateTime.UtcNow);
+            if (spent >= budgetUsd * 0.8m && budgetAlertDay != today)
+            {
+                budgetAlertDay = today;
+                logger.LogWarning("budget alert: users spent {Spent} of {Budget} USD today, 80% threshold reached", spent, budgetUsd);
+            }
         }
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "budget check failed for request {RequestId}", requestId);
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "budget check failed for request {RequestId}", requestId);
+        }
     }
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
@@ -156,7 +161,14 @@ app.MapGet("/cost", async (ILogger<Program> logger) =>
 {
     try
     {
-        return Results.Json(new { today_usd = await TodayCostUsd(dbConn), budget_usd = budgetUsd });
+        // today_usd лишається загальним, бо гроші за evals теж справжні. Розбивка показує, хто витратив.
+        var cost = await TodayCostUsd(dbConn);
+        return Results.Json(new
+        {
+            today_usd = cost.Total,
+            budget_usd = budgetUsd,
+            by_source = new { user = cost.User, eval = cost.Eval },
+        });
     }
     catch (Exception ex)
     {
@@ -248,7 +260,8 @@ app.Run("http://0.0.0.0:8080");
 // Другий крок завжди інший провайдер. mock-mini і mock-strong живуть на одному
 // mock-provider і падають разом, тож перехід між ними від падіння не рятує.
 // Ескалацію не спускаємо на слабшу модель. Повернення і скарги краще віддати людині.
-// budget policy: на 80% денного бюджету пишемо алерт у лог і маршрут не міняємо, бо faq і standard уже на найдешевшій моделі, а ескалацію свідомо не здешевлюємо.
+// budget policy: на 80% денного бюджету за клієнтськими витратами (source = user) пишемо алерт у лог і маршрут не міняємо, бо faq і standard уже на найдешевшій моделі, а ескалацію свідомо не здешевлюємо.
+// Evals у поріг не входять. Політика керує маршрутом клієнтів, і прогін у CI не повинен їх різати. Свій ліміт для evals буде на W6.
 static (string Model, string Tier) Route(string message, string defaultModel)
 {
     var tier = Tier(message);
@@ -296,17 +309,22 @@ static string? Actor(HttpContext ctx)
     return ip is null ? null : $"ip:{ip}";
 }
 
-// витрати за сьогодні. Одна функція і для GET /cost, і для порогу бюджету, щоб не розійшлись.
+// витрати за сьогодні, усього і окремо за source. Одна функція і для GET /cost,
+// і для порогу бюджету, щоб не розійшлись. Один запит, FILTER ділить суму без другого походу.
 // Діапазон дає той самий день, що й created_at::date = CURRENT_DATE, але може взяти індекс.
 // SUM без рядків дає NULL, тому COALESCE до нуля. Тут нуль чесний, бо витрат не було.
-static async Task<decimal> TodayCostUsd(string conn)
+static async Task<(decimal Total, decimal User, decimal Eval)> TodayCostUsd(string conn)
 {
     await using var db = new NpgsqlConnection(conn);
     await db.OpenAsync();
     await using var cmd = new NpgsqlCommand(
-        "SELECT COALESCE(SUM(cost_usd), 0) FROM requests "
-        + "WHERE created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + 1", db);
-    return (decimal)(await cmd.ExecuteScalarAsync())!;
+        "SELECT COALESCE(SUM(cost_usd), 0), "
+        + "COALESCE(SUM(cost_usd) FILTER (WHERE source = 'user'), 0), "
+        + "COALESCE(SUM(cost_usd) FILTER (WHERE source = 'eval'), 0) "
+        + "FROM requests WHERE created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + 1", db);
+    await using var reader = await cmd.ExecuteReaderAsync();
+    await reader.ReadAsync();
+    return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetDecimal(2));
 }
 
 // дістає активний промпт і його версію з реєстру.
