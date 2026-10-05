@@ -1,9 +1,15 @@
 -- Базова схема. Студент розширює під власні потреби.
 
+-- Один рядок на один виклик моделі. Одне звернення до /chat (request_id) може дати
+-- кілька викликів: retry, fallback, tool-цикл. Ціна звернення це SUM(cost_usd) GROUP BY request_id.
 CREATE TABLE IF NOT EXISTS requests (
-    request_id      UUID PRIMARY KEY,
+    id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    request_id      UUID NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     model           TEXT NOT NULL,
+    tier            TEXT,  -- faq / standard / escalation, клас запиту замість тексту повідомлення
+    -- джерело запиту, клієнт або прогін evals.
+    source          TEXT NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'eval')),
     provider        TEXT,
     prompt_version  TEXT,
     latency_ms      INTEGER,
@@ -42,6 +48,7 @@ CREATE TABLE IF NOT EXISTS prompt_activations (
 
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests (created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests (model);
+CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests (request_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_activations_at ON prompt_activations (activated_at);
 
 -- Seed реєстру. Живе в міграції, а не в коді сервісу.

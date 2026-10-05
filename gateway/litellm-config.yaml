@@ -43,6 +43,21 @@ model_list:
       api_key: os.environ/AZURE_API_KEY
       api_version: os.environ/AZURE_API_VERSION
 
+  # новий провайдер (W2): Anthropic. У нього свій API, не OpenAI-сумісний.
+  # LiteLLM перекладає його в той самий /v1/chat/completions, тому сервіс
+  # шле той самий payload і коду виклику моделі не міняємо.
+  # Ключ ANTHROPIC_API_KEY кладемо в gateway/.env.
+  # Місце у fallback-порядку описане біля Route() у service/Program.cs.
+  - model_name: claude-opus-5-5
+    litellm_params:
+      model: anthropic/claude-opus-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
 litellm_settings:
   drop_params: true
   num_retries: 0   # збої віддаємо в сервіс (reliability — робота студента), не ретраїмо приховано
