@@ -46,9 +46,27 @@ CREATE TABLE IF NOT EXISTS prompt_activations (
     actor        TEXT
 );
 
+-- Слід кожного tool-виклику: хто (request_id), що (tool), з чим (args), з яким результатом (status, result).
+-- idempotency_key є лише в незворотних дій. UNIQUE дає один виконаний виклик на ключ, а NULL між собою не конфліктують.
+-- status: pending, ok, timeout, error, duplicate, invalid_args, unknown_tool
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    request_id       UUID NOT NULL,
+    conversation_id  TEXT,
+    tool             TEXT NOT NULL,
+    category         TEXT,
+    args             TEXT,
+    idempotency_key  TEXT UNIQUE,
+    status           TEXT NOT NULL,
+    result           TEXT,
+    latency_ms       INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests (created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests (model);
 CREATE INDEX IF NOT EXISTS idx_requests_request_id ON requests (request_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_request_id ON tool_calls (request_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_activations_at ON prompt_activations (activated_at);
 
 -- Seed реєстру. Живе в міграції, а не в коді сервісу.
