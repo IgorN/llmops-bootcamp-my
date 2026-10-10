@@ -6,6 +6,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Npgsql;
 using StackExchange.Redis;
 
@@ -57,6 +58,24 @@ var cacheTtlByTier = new Dictionary<string, TimeSpan>
 var cacheTtlOverride = int.TryParse(Environment.GetEnvironmentVariable("CACHE_TTL_SECONDS"), out var ttlSeconds)
     ? TimeSpan.FromSeconds(ttlSeconds)
     : (TimeSpan?)null;
+
+// реєстр інструментів (W3) як дані, а не switch. Модель лише просить інструмент,
+// виконує сервіс і лише те, що є в цій таблиці. Кожен запис має схему аргументів, категорію і таймаут.
+// Контракт для незворотних дій (W4): незворотне -> заявка в /approvals -> виконання після підтвердження людиною.
+// Поки create_ticket виконується автономно. Це відома дірка, її закриє W4.
+var toolRegistry = new Dictionary<string, ToolSpec>
+{
+    ["lookup_order"] = new(
+        ToolCategory.ReadOnly,
+        TimeSpan.FromSeconds(2),
+        """{"type":"object","properties":{"order_id":{"type":"string"}},"additionalProperties":false}""",
+        (args, ctx, ct) => FakeOrders.Lookup(args, ctx.Message, ct)),
+    ["create_ticket"] = new(
+        ToolCategory.Irreversible,
+        TimeSpan.FromSeconds(5),
+        """{"type":"object","properties":{"reason":{"type":"string"}},"additionalProperties":false}""",
+        (args, ctx, ct) => Task.FromResult("тікет #T-" + Guid.NewGuid().ToString("N")[..4])),
+};
 
 app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory httpFactory, ILogger<Program> logger) =>
 {
@@ -135,6 +154,7 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     var http = httpFactory.CreateClient();
     var answer = "";
     string? toolCall = null;
+    var toolArgs = "{}";
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
     var usageKnown = false;  // без usage вартість невідома, і це null, а не нуль
     try
@@ -149,13 +169,14 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
         answer = message.GetProperty("content").GetString() ?? "";
 
-        // tools + HITL (W3/W4): якщо модель попросила інструмент — виконати;
-        // перед незворотною дією (створити тікет) спитати людину. поки лише читаємо назву.
-        // TODO(student, W3/W4)
+        // tools (W3): модель лише просить інструмент, тут читаємо назву й аргументи.
+        // Виконання нижче, після usage, щоб збій інструмента не зіпсував облік вартості.
         if (message.TryGetProperty("tool_calls", out var tools)
             && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
         {
-            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+            var function = tools[0].GetProperty("function");
+            toolCall = function.GetProperty("name").GetString();
+            toolArgs = function.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
         }
 
         var usage = doc.RootElement.GetProperty("usage");
@@ -168,6 +189,15 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
         // TODO(student, W4): тут краще graceful degradation
         answer = "Сервіс тимчасово недоступний.";
+    }
+
+    // виконуємо інструмент і підклеюємо результат до відповіді. Таймаут і помилка це оброблені гілки,
+    // користувач отримує чесну примітку замість зависання чи 500.
+    if (toolCall is not null && status == 200)
+    {
+        var spec = toolRegistry.GetValueOrDefault(toolCall);
+        var outcome = await ToolRuntime.ExecuteTool(spec, toolCall, toolArgs, new ToolContext(requestId, body.ConversationId, body.Message), dbConn, logger);
+        answer += ToolRuntime.ToolNote(spec, outcome);
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
@@ -464,7 +494,9 @@ static async Task LogRequest(string conn, Guid id, string model, string tier, st
     catch { /* не валимо запит через лог */ }
 }
 
-record ChatIn(string Message);
+// conversation_id необовʼязковий. UI його не шле, тому ключ ідемпотентності тоді привʼязаний до request_id.
+record ChatIn(string Message, [property: JsonPropertyName("conversation_id")] string? ConversationId = null);
+
 record CacheEntry(string Answer, DateTimeOffset CreatedAt, TimeSpan Ttl);
 
 // кеш відповідей. Дві реалізації з однаковою поведінкою, щоб /chat не знав, де лежать записи.
