@@ -2,9 +2,12 @@
 // (яку модель брати, коли ретраїти, скільки коштує) робимо тут.
 // MODEL=mock — дефолт, грошей не треба. MODEL=gpt-5-mini + ключ у gateway/.env — реальна модель.
 
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Npgsql;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
@@ -34,6 +37,27 @@ var prices = new Dictionary<string, (decimal In, decimal Out)>
 var budgetUsd = 5.00m;  // денний бюджет
 var budgetAlertDay = DateOnly.MinValue;  // щоб алерт був раз на день, а не на кожен запит
 
+// кеш (W3): з REDIS_URL живе в Redis і переживає рестарт, спільний для всіх інстансів.
+// Без нього кеш у памʼяті процесу, тож стек за замовчуванням працює без Redis.
+var redisUrl = Environment.GetEnvironmentVariable("REDIS_URL");
+IResponseCache cache = string.IsNullOrWhiteSpace(redisUrl)
+    ? new MemoryResponseCache()
+    : new RedisResponseCache(redisUrl);
+var cacheStats = new CacheStats();
+
+// TTL це властивість класу запиту, а не одне число на все.
+// FAQ змінюється рідко, тому живе добу. Звичайні відповіді годину.
+// escalation тут немає навмисно, бо повернення і скарги не кешуємо ніколи.
+// CACHE_TTL_SECONDS лише для перевірки, він підміняє TTL усіх рівнів.
+var cacheTtlByTier = new Dictionary<string, TimeSpan>
+{
+    ["faq"] = TimeSpan.FromHours(24),
+    ["standard"] = TimeSpan.FromHours(1),
+};
+var cacheTtlOverride = int.TryParse(Environment.GetEnvironmentVariable("CACHE_TTL_SECONDS"), out var ttlSeconds)
+    ? TimeSpan.FromSeconds(ttlSeconds)
+    : (TimeSpan?)null;
+
 app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory httpFactory, ILogger<Program> logger) =>
 {
     var requestId = Guid.NewGuid();
@@ -62,8 +86,39 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
-    // TODO(student, W3)
+    // cache (W3): ключ з моделі, тексту промпта і нормалізованого питання.
+    // Промпт у ключі обовʼязковий. Інакше після rollback кеш віддавав би відповіді старої версії,
+    // і регресію не побачили б ні користувачі, ні evals.
+    var cacheKey = CacheKey(model, systemPrompt, body.Message);
+    TimeSpan? cacheTtl = cacheTtlByTier.TryGetValue(tier, out var tierTtl) ? cacheTtlOverride ?? tierTtl : null;
+
+    // недоступний кеш дорівнює miss. Він прискорює відповідь, але не має права її зламати.
+    string? cachedAnswer = null;
+    if (cacheTtl is not null)
+    {
+        try
+        {
+            cachedAnswer = await cache.Get(cacheKey);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "cache unavailable, request {RequestId} goes to the model", requestId);
+        }
+    }
+
+    if (cachedAnswer is not null)
+    {
+        // hit: модель не викликаємо. Нульові токени і cost_usd = 0 у лозі доводять влучання,
+        // а не мала затримка, бо на mock промах теж займає мілісекунди.
+        var hits = Interlocked.Increment(ref cacheStats.Hits);
+        logger.LogInformation("cache hit, hits {Hits}, misses {Misses}", hits, Interlocked.Read(ref cacheStats.Misses));
+        var hitLatencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        await LogRequest(dbConn, requestId, model, tier, source, promptVersion, hitLatencyMs, 0, 0, 0m, 200);
+        return Results.Json(new { request_id = requestId, content = cachedAnswer, tool = (string?)null, latency_ms = hitLatencyMs, cache = "hit" });
+    }
+
+    var misses = Interlocked.Increment(ref cacheStats.Misses);
+    logger.LogInformation("cache miss, hits {Hits}, misses {Misses}", Interlocked.Read(ref cacheStats.Hits), misses);
 
     // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
     // TODO(student, W4)
@@ -117,6 +172,23 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
+    // що в нашій системі кешувати заборонено
+    // 1. Відповідь із tool-викликом. Вона про конкретного клієнта (замовлення, тікет), і чужий клієнт отримав би чужі дані.
+    // 2. Ескалації, тобто повернення і скарги. Кожна унікальна, і для них немає TTL.
+    // 3. Помилки й заглушки (не 200, без usage). Інакше збій жив би до кінця TTL.
+    // 4. Відповідь на резервному промпті (версія none). Реєстр зламаний, і відповідь лише заглушка.
+    if (cacheTtl is { } ttl && status == 200 && usageKnown && toolCall is null && promptVersion != "none" && answer.Length > 0)
+    {
+        try
+        {
+            await cache.Set(cacheKey, answer, ttl);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "cache write failed for request {RequestId}", requestId);
+        }
+    }
+
     // cost (W2): usage з відповіді, ціна за моделлю з прайсу. Нема тарифу або usage, буде null.
     // Нуль лишаємо для випадку, коли виклику справді не було (cache-hit з W3).
     // Округлення до 6 знаків як у колонці NUMERIC(10, 6).
@@ -150,12 +222,23 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         }
     }
 
-    return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
+    return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs, cache = "miss" });
 });
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
+// W3: поки лише лічильники кешу з памʼяті процесу, тож після рестарту вони з нуля.
+// W5 порахує все з таблиці requests: p95_ms, error_rate_pct, fallback_events.
+app.MapGet("/observability", () =>
+{
+    var hits = Interlocked.Read(ref cacheStats.Hits);
+    var total = hits + Interlocked.Read(ref cacheStats.Misses);
+    return Results.Json(new
+    {
+        requests = total,
+        cache_hit_pct = total == 0 ? (double?)null : Math.Round(100.0 * hits / total, 1),
+    });
+});
 // W2: витрати за сьогодні з БД плюс бюджет. Без БД 503, а не нуль, бо нуль збреше плитці.
 app.MapGet("/cost", async (ILogger<Program> logger) =>
 {
@@ -327,6 +410,15 @@ static async Task<(decimal Total, decimal User, decimal Eval)> TodayCostUsd(stri
     return (reader.GetDecimal(0), reader.GetDecimal(1), reader.GetDecimal(2));
 }
 
+// ключ кешу. Хеш, щоб ключ мав сталу довжину і не тримав сирий текст.
+// Регістр і зайві пробіли не змінюють питання, тож нормалізуємо їх.
+static string CacheKey(string model, string systemPrompt, string message)
+{
+    var normalized = string.Join(' ', message.ToLowerInvariant().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    var hash = SHA256.HashData(Encoding.UTF8.GetBytes($"{model}\n{systemPrompt}\n{normalized}"));
+    return Convert.ToHexString(hash);
+}
+
 // дістає активний промпт і його версію з реєстру.
 // Порожній реєстр це не помилка, а стан. Віддаємо резервний промпт без маркера
 // "support" і версію "none", щоб поломку було видно і в чаті, і в лозі.
@@ -373,3 +465,69 @@ static async Task LogRequest(string conn, Guid id, string model, string tier, st
 }
 
 record ChatIn(string Message);
+record CacheEntry(string Answer, DateTimeOffset CreatedAt, TimeSpan Ttl);
+
+// кеш відповідей. Дві реалізації з однаковою поведінкою, щоб /chat не знав, де лежать записи.
+interface IResponseCache
+{
+    Task<string?> Get(string key);
+    Task Set(string key, string answer, TimeSpan ttl);
+}
+
+// у памʼяті. Разом із відповіддю тримаємо час створення і TTL, прострочений запис дорівнює miss.
+class MemoryResponseCache : IResponseCache
+{
+    private readonly ConcurrentDictionary<string, CacheEntry> entries = new();
+
+    public Task<string?> Get(string key)
+    {
+        if (entries.TryGetValue(key, out var entry))
+        {
+            if (DateTimeOffset.UtcNow - entry.CreatedAt < entry.Ttl) return Task.FromResult<string?>(entry.Answer);
+            entries.TryRemove(new KeyValuePair<string, CacheEntry>(key, entry));
+        }
+        return Task.FromResult<string?>(null);
+    }
+
+    public Task Set(string key, string answer, TimeSpan ttl)
+    {
+        entries[key] = new CacheEntry(answer, DateTimeOffset.UtcNow, ttl);
+        return Task.CompletedTask;
+    }
+}
+
+// у Redis. TTL ставить сам Redis через expiry, прострочений ключ просто зникає.
+// FailFast і короткі таймаути, щоб недоступний Redis давав швидкий miss, а не чекання.
+class RedisResponseCache : IResponseCache
+{
+    private const string Prefix = "llm:answer:";
+    private readonly ConnectionMultiplexer redis;
+
+    public RedisResponseCache(string url)
+    {
+        var options = ConfigurationOptions.Parse(url);
+        options.AbortOnConnectFail = false;
+        options.ConnectTimeout = 2000;
+        options.SyncTimeout = 500;
+        options.AsyncTimeout = 500;
+        options.BacklogPolicy = BacklogPolicy.FailFast;
+        redis = ConnectionMultiplexer.Connect(options);
+    }
+
+    public async Task<string?> Get(string key)
+    {
+        var value = await redis.GetDatabase().StringGetAsync(Prefix + key);
+        return value.HasValue ? value.ToString() : null;
+    }
+
+    public Task Set(string key, string answer, TimeSpan ttl) =>
+        redis.GetDatabase().StringSetAsync(Prefix + key, answer, ttl);
+}
+
+// лічильники кешу. Поля, а не властивості, бо Interlocked потребує ref.
+// У консолі вони зʼявляться на W5, а поки їх видно в лозі процесу.
+class CacheStats
+{
+    public long Hits;
+    public long Misses;
+}
