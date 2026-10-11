@@ -43,8 +43,17 @@ public static class ToolRuntime
             return new ToolOutcome(status, result);
         }
 
+        // незворотна дія без ідентифікатора дії в реєстрі не виконується. Ключ з аргументів тут не годиться,
+        // бо порожні аргументи склеюють різні дії, а вільний текст розводить ту саму дію на різні ключі.
+        if (spec.ActionId is null)
+        {
+            await LogToolCall(conn, ctx, name, spec.Category, canonicalArgs, null, "error", null, null, logger);
+            logger.LogError("irreversible tool {Tool} has no ActionId in registry, not executed", name);
+            return new ToolOutcome("error", null);
+        }
+
         // незворотна дія. Без бази ідемпотентність не гарантувати, тому не виконуємо зовсім.
-        var key = IdempotencyKey(ctx.ConversationId ?? ctx.RequestId.ToString(), name, canonicalArgs);
+        var key = IdempotencyKey(ctx.ConversationId ?? ctx.RequestId.ToString(), name, spec.ActionId(args, ctx));
         try
         {
             await using var db = new NpgsqlConnection(conn);
@@ -156,11 +165,12 @@ public static class ToolRuntime
             .OrderBy(p => p.Name, StringComparer.Ordinal)
             .ToDictionary(p => p.Name, p => p.Value));
 
-    // ключ ідемпотентності = hash(розмова, інструмент, аргументи).
+    // ключ ідемпотентності = hash(розмова, інструмент, ідентифікатор дії).
     // Розмова, а не HTTP-запит, бо повтор того самого прохання приходить новим запитом.
     // Без conversation_id беремо request_id, і тоді ключ захищає лише від повтору всередині одного запиту.
-    public static string IdempotencyKey(string scope, string tool, string canonicalArgs) =>
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{scope}\n{tool}\n{canonicalArgs}")));
+    // Ідентифікатор дії стабільний (номер замовлення), а не вільний текст аргументів.
+    public static string IdempotencyKey(string scope, string tool, string actionId) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{scope}\n{tool}\n{actionId}")));
 
     // слід tool-виклику. Падіння логу не валить відповідь.
     public static async Task LogToolCall(string conn, ToolContext ctx, string tool, ToolCategory? category, string args,
@@ -200,15 +210,42 @@ public static class ToolRuntime
 }
 
 public enum ToolCategory { ReadOnly, Irreversible }
-public record ToolSpec(ToolCategory Category, TimeSpan Timeout, string ArgsSchema, Func<JsonElement, ToolContext, CancellationToken, Task<string>> Run);
+// ActionId потрібен лише незворотним діям. Він каже, яку саме дію ми робимо, і з нього будується ключ ідемпотентності.
+public record ToolSpec(ToolCategory Category, TimeSpan Timeout, string ArgsSchema,
+    Func<JsonElement, ToolContext, CancellationToken, Task<string>> Run,
+    Func<JsonElement, ToolContext, string>? ActionId = null);
 public record ToolContext(Guid RequestId, string? ConversationId, string Message);
 public record ToolOutcome(string Status, string? Result);
 
-// фейковий бекенд замовлень. Модель mock шле порожні аргументи, тому номер беремо з повідомлення.
-// Справжня модель заповнила б order_id за схемою з реєстру.
+// номер замовлення для інструментів. Справжня модель заповнила б order_id за схемою з реєстру,
+// а mock шле порожні аргументи, тому запасний варіант це перший #номер у повідомленні.
+public static class Orders
+{
+    public static string? OrderId(JsonElement args, string message)
+    {
+        if (args.ValueKind == JsonValueKind.Object && args.TryGetProperty("order_id", out var v) && v.GetString() is { Length: > 0 } fromArgs)
+            return fromArgs;
+        var match = Regex.Match(message, @"#(\d+)");
+        return match.Success ? match.Groups[1].Value : null;
+    }
+
+    // ідентифікатор дії для create_ticket. Різні замовлення в одній розмові це різні тікети,
+    // те саме замовлення іншими словами це той самий тікет.
+    // Без номера всі звернення розмови вважаються однією дією, щоб повтор не плодив тікети.
+    public static string TicketActionId(JsonElement args, ToolContext ctx) =>
+        "order:" + (OrderId(args, ctx.Message) ?? "none");
+
+    public static Task<string> CreateTicket(JsonElement args, ToolContext ctx)
+    {
+        var ticket = "тікет #T-" + Guid.NewGuid().ToString("N")[..4];
+        return Task.FromResult(OrderId(args, ctx.Message) is { } order ? $"{ticket} щодо замовлення #{order}" : ticket);
+    }
+}
+
+// фейковий бекенд замовлень
 public static class FakeOrders
 {
-    private static readonly Dictionary<string, string> Orders = new()
+    private static readonly Dictionary<string, string> Statuses = new()
     {
         ["123"] = "статус: оплачено, доставку призначено",
         ["10482"] = "статус: оплачено, доставку призначено",
@@ -217,9 +254,9 @@ public static class FakeOrders
 
     public static async Task<string> Lookup(JsonElement args, string message, CancellationToken ct)
     {
-        var id = args.TryGetProperty("order_id", out var v) ? v.GetString() : Regex.Match(message, @"#(\d+)").Groups[1].Value;
+        var id = Orders.OrderId(args, message);
         // 99999 імітує повільний бекенд, щоб перевірити гілку таймауту
         if (id == "99999") await Task.Delay(TimeSpan.FromSeconds(3), ct);
-        return Orders.TryGetValue(id ?? "", out var status) ? status : "замовлення не знайдено";
+        return Statuses.TryGetValue(id ?? "", out var status) ? status : "замовлення не знайдено";
     }
 }

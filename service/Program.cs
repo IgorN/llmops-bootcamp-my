@@ -70,11 +70,13 @@ var toolRegistry = new Dictionary<string, ToolSpec>
         TimeSpan.FromSeconds(2),
         """{"type":"object","properties":{"order_id":{"type":"string"}},"additionalProperties":false}""",
         (args, ctx, ct) => FakeOrders.Lookup(args, ctx.Message, ct)),
+    // reason це вільний текст, у ключ ідемпотентності він не йде. Ключ будується з номера замовлення.
     ["create_ticket"] = new(
         ToolCategory.Irreversible,
         TimeSpan.FromSeconds(5),
-        """{"type":"object","properties":{"reason":{"type":"string"}},"additionalProperties":false}""",
-        (args, ctx, ct) => Task.FromResult("тікет #T-" + Guid.NewGuid().ToString("N")[..4])),
+        """{"type":"object","properties":{"order_id":{"type":"string"},"reason":{"type":"string"}},"additionalProperties":false}""",
+        (args, ctx, ct) => Orders.CreateTicket(args, ctx),
+        ActionId: Orders.TicketActionId),
 };
 
 app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory httpFactory, ILogger<Program> logger) =>

@@ -72,7 +72,8 @@ public class ToolRuntimeTests
         // без бази ключ ідемпотентності не зарезервувати, тож дію не виконуємо зовсім
         var executed = false;
         var spec = new ToolSpec(ToolCategory.Irreversible, TimeSpan.FromSeconds(1), """{"type":"object","properties":{}}""",
-            (_, _, _) => { executed = true; return Task.FromResult("тікет"); });
+            (_, _, _) => { executed = true; return Task.FromResult("тікет"); },
+            ActionId: Orders.TicketActionId);
 
         var outcome = await ToolRuntime.ExecuteTool(spec, "create_ticket", "{}", Ctx("conv-1"), NoDb, NullLogger.Instance);
 
@@ -81,18 +82,54 @@ public class ToolRuntimeTests
         Assert.Contains("оператор", ToolRuntime.ToolNote(spec, outcome));
     }
 
+    // сценарій з ревʼю: дві різні дії в одній розмові не склеюються, а та сама дія іншими словами склеюється
+    private static string TicketKey(string conversation, string args, string message) =>
+        ToolRuntime.IdempotencyKey(conversation, "create_ticket",
+            Orders.TicketActionId(Json(args), new ToolContext(Guid.NewGuid(), conversation, message)));
+
     [Fact]
-    public void Idempotency_key_ignores_field_order_and_depends_on_conversation_tool_and_args()
+    public void Different_orders_in_one_conversation_get_different_keys()
     {
-        string Key(string conv, string tool, string args) =>
-            ToolRuntime.IdempotencyKey(conv, tool, ToolRuntime.CanonicalArgs(Json(args)));
+        Assert.NotEqual(
+            TicketKey("conv-1", "{}", "поверніть гроші за замовлення #123"),
+            TicketKey("conv-1", "{}", "і ще терміново поверніть гроші за замовлення #555, там інший товар"));
+    }
 
-        var baseKey = Key("conv-1", "create_ticket", """{"a":"1","b":"2"}""");
+    [Fact]
+    public void Same_order_in_other_words_gets_the_same_key()
+    {
+        Assert.Equal(
+            TicketKey("conv-1", """{"reason":"refund"}""", "поверніть гроші за замовлення #123"),
+            TicketKey("conv-1", """{"reason":"клієнт дуже незадоволений, хоче гроші назад"}""", "терміново, гроші за #123"));
+    }
 
-        Assert.Equal(baseKey, Key("conv-1", "create_ticket", """{"b":"2","a":"1"}"""));
-        Assert.NotEqual(baseKey, Key("conv-2", "create_ticket", """{"a":"1","b":"2"}"""));
-        Assert.NotEqual(baseKey, Key("conv-1", "refund", """{"a":"1","b":"2"}"""));
-        Assert.NotEqual(baseKey, Key("conv-1", "create_ticket", """{"a":"1","b":"3"}"""));
+    [Fact]
+    public void Order_from_args_wins_over_message()
+    {
+        Assert.Equal(
+            TicketKey("conv-1", """{"order_id":"555"}""", "щось про #123"),
+            TicketKey("conv-1", "{}", "поверніть гроші за #555"));
+    }
+
+    [Fact]
+    public void Same_order_in_other_conversation_gets_another_key()
+    {
+        Assert.NotEqual(
+            TicketKey("conv-1", "{}", "поверніть гроші за #123"),
+            TicketKey("conv-2", "{}", "поверніть гроші за #123"));
+    }
+
+    [Fact]
+    public async Task Irreversible_tool_without_action_id_is_not_executed()
+    {
+        var executed = false;
+        var spec = new ToolSpec(ToolCategory.Irreversible, TimeSpan.FromSeconds(1), """{"type":"object","properties":{}}""",
+            (_, _, _) => { executed = true; return Task.FromResult("тікет"); });
+
+        var outcome = await ToolRuntime.ExecuteTool(spec, "create_ticket", "{}", Ctx("conv-1"), NoDb, NullLogger.Instance);
+
+        Assert.Equal("error", outcome.Status);
+        Assert.False(executed);
     }
 
     [Fact]
