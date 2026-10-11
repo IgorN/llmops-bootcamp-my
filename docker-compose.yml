@@ -11,6 +11,8 @@ services:
       - GATEWAY_URL=http://gateway:4000
       - DB_CONN=Host=postgres;Database=llmops;Username=llmops;Password=llmops
       - MODEL=${MODEL:-mock}   # mock (за замовч.) або напр. gpt-5-mini (потрібен ключ у gateway/.env)
+      - REDIS_URL=${REDIS_URL:-}   # порожньо = кеш у памʼяті; redis:6379 разом із --profile advanced
+      - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-}   # лише для перевірки TTL, порожньо = TTL за рівнем запиту
     depends_on: [gateway, postgres]
 
   gateway:
