@@ -66,10 +66,17 @@ var breakers = new ConcurrentDictionary<string, Breaker>();
 var breakerHalfOpen = Environment.GetEnvironmentVariable("BREAKER_HALF_OPEN") != "false";
 var modelTimeout = TimeSpan.FromSeconds(10);
 
+// HITL (W4): черга заявок на незворотні дії. Заявка без рішення не висить вічно, а через строк стає expired.
+// APPROVAL_TTL_SECONDS лише для перевірки, щоб не чекати годину.
+var approvalTtl = int.TryParse(Environment.GetEnvironmentVariable("APPROVAL_TTL_SECONDS"), out var approvalSeconds)
+    ? TimeSpan.FromSeconds(approvalSeconds)
+    : TimeSpan.FromHours(1);
+var approvals = new ApprovalQueue(approvalTtl);
+
 // реєстр інструментів (W3) як дані, а не switch. Модель лише просить інструмент,
 // виконує сервіс і лише те, що є в цій таблиці. Кожен запис має схему аргументів, категорію і таймаут.
-// Контракт для незворотних дій (W4): незворотне -> заявка в /approvals -> виконання після підтвердження людиною.
-// Поки create_ticket виконується автономно. Це відома дірка, її закриє W4.
+// Незворотна дія (W4) не виконується з /chat, а стає заявкою в /approvals і виконується лише після підтвердження людиною.
+// Гейт вирішує за категорією в реєстрі, тож новий незворотний інструмент піде через людину без правок у /chat.
 var toolRegistry = new Dictionary<string, ToolSpec>
 {
     ["lookup_order"] = new(
@@ -92,11 +99,21 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     var startedAt = DateTimeOffset.UtcNow;
     var source = Source(ctx);
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): вхід маскуємо першим кроком. Далі по запиту живе лише замаскований текст:
+    // роутер, ключ кешу, модель, заявка оператору. Сирий текст не йде ні в модель, ні в кеш, ні в лог.
+    var message = Guards.MaskPii(body.Message);
+
+    // відомі шаблони injection відбиваємо до моделі. Відмова це механізм сервісу, а не добра воля моделі,
+    // тож вона не залежить ні від промпта, ні від провайдера. Кожне спрацювання це подія в лозі.
+    if (Guards.InjectionFamily(message) is { } family)
+    {
+        logger.LogWarning("guardrail: injection, family {Family}, request {RequestId}", family, requestId);
+        return Results.Json(new { request_id = requestId, content = "Не можу допомогти з цим запитом.", tool = (string?)null,
+            latency_ms = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds, cache = "miss", guardrail = "injection" });
+    }
 
     // routing (W2): модель за рівнем (tier) запиту. Рівень пишемо в лог, щоб бачити частку трафіку.
-    var (model, tier) = Route(body.Message, defaultModel);
+    var (model, tier) = Route(message, defaultModel);
 
     // промпт (W1): активна версія з реєстру.
     // Недоступна БД не дорівнює порожньому реєстру. Без неї не буде ні промпта,
@@ -117,7 +134,7 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     // cache (W3): ключ з моделі, тексту промпта і нормалізованого питання.
     // Промпт у ключі обовʼязковий. Інакше після rollback кеш віддавав би відповіді старої версії,
     // і регресію не побачили б ні користувачі, ні evals.
-    var cacheKey = CacheKey(model, systemPrompt, body.Message);
+    var cacheKey = CacheKey(model, systemPrompt, message);
     TimeSpan? cacheTtl = cacheTtlByTier.TryGetValue(tier, out var tierTtl) ? cacheTtlOverride ?? tierTtl : null;
 
     // недоступний кеш дорівнює miss. Він прискорює відповідь, але не має права її зламати.
@@ -165,7 +182,7 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         if (i > 0) Interlocked.Increment(ref stats.Fallbacks);
         attempted = true;
 
-        var attempt = await Reliability.CallGateway(http, gateway, chain[i], systemPrompt, body.Message, modelTimeout);
+        var attempt = await Reliability.CallGateway(http, gateway, chain[i], systemPrompt, message, modelTimeout);
         breaker.Record(attempt.Ok, DateTimeOffset.UtcNow);
 
         // cost (W2): usage з відповіді, ціна за моделлю з прайсу. Нема тарифу або usage, буде null.
@@ -208,11 +225,23 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
 
     // виконуємо інструмент і підклеюємо результат до відповіді. Таймаут і помилка це оброблені гілки,
     // користувач отримує чесну примітку замість зависання чи 500.
+    // HITL-гейт (W4): це єдина точка, де /chat вирішує долю інструмента. Незворотний не виконується,
+    // а стає заявкою, і у відповіді немає ні номера тікета, ні «зроблено».
     if (ok && toolCall is not null)
     {
         var spec = toolRegistry.GetValueOrDefault(toolCall);
-        var outcome = await ToolRuntime.ExecuteTool(spec, toolCall, result!.ToolArgs, new ToolContext(requestId, body.ConversationId, body.Message), dbConn, logger);
-        answer += ToolRuntime.ToolNote(spec, outcome);
+        var toolContext = new ToolContext(requestId, body.ConversationId, message);
+        if (spec?.Category == ToolCategory.Irreversible)
+        {
+            var approval = approvals.Enqueue(toolCall, result!.ToolArgs, toolContext, DateTimeOffset.UtcNow);
+            logger.LogInformation("approval {ApprovalId} queued for {Tool}, request {RequestId}", approval.Id, toolCall, requestId);
+            answer += $" (очікує підтвердження оператора, id={approval.Id})";
+        }
+        else
+        {
+            var outcome = await ToolRuntime.ExecuteTool(spec, toolCall, result!.ToolArgs, toolContext, dbConn, logger);
+            answer += ToolRuntime.ToolNote(spec, outcome);
+        }
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
@@ -371,7 +400,36 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpContext ct
     }
 });
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+// W4: черга заявок. pending читає консоль, а виконані лишаються в done з результатом,
+// щоб після approve було видно номер тікета і що він рівно один.
+app.MapGet("/approvals", () =>
+{
+    var all = approvals.Snapshot(DateTimeOffset.UtcNow);
+    return Results.Json(new
+    {
+        pending = all.Where(a => a.Status == "pending")
+            .Select(a => new { id = a.Id, action = a.Tool, message = a.Context.Message, created_at = a.CreatedAt }),
+        done = all.Where(a => a.Status != "pending")
+            .Select(a => new { id = a.Id, action = a.Tool, status = a.Status, result = a.Result, decided_at = a.DecidedAt, actor = a.Actor }),
+    });
+});
+
+// W4: виконання незворотної дії живе тільки тут, після людського «так».
+// Повтор, невідомий id і прострочена заявка дають однаковий 404: «вже виконано» і «не існувало»
+// нерозрізненні, щоб відповідь не підказувала, які id існують.
+app.MapPost("/approvals/{id}/approve", async (string id, HttpContext ctx, ILogger<Program> logger) =>
+{
+    var claimed = approvals.TryClaim(id, Actor(ctx), DateTimeOffset.UtcNow);
+    if (claimed is null) return Results.NotFound(new { error = "already done" });
+
+    // через той самий ToolRuntime, що й раніше: ключ ідемпотентності, таймаут і слід у tool_calls лишаються
+    var spec = toolRegistry.GetValueOrDefault(claimed.Tool);
+    var outcome = await ToolRuntime.ExecuteTool(spec, claimed.Tool, claimed.ArgsJson, claimed.Context, dbConn, logger);
+    var done = approvals.Complete(claimed, outcome.Status == "ok",
+        outcome.Result ?? ToolRuntime.ToolNote(spec, outcome).Trim(' ', '(', ')'), DateTimeOffset.UtcNow);
+    logger.LogInformation("approval {ApprovalId} {Status} by {Actor}", done.Id, done.Status, done.Actor);
+    return Results.Ok(new { id = done.Id, status = done.Status, result = done.Result });
+});
 
 app.Run("http://0.0.0.0:8080");
 
