@@ -28,6 +28,7 @@ var prices = new Dictionary<string, (decimal In, decimal Out)>
 {
     ["mock-mini"] = (0.00015m, 0.0006m),
     ["mock-strong"] = (0.0025m, 0.01m),
+    ["mock"] = (0.00015m, 0.0006m),  // резерв ланцюга на mock-стенді, ціна як у mock-mini
     // OpenAI станом на 2026-10-04, developers.openai.com/api/docs/pricing ($/1M: mini 0.25/2, gpt-5 1.25/10)
     ["gpt-5-mini"] = (0.00025m, 0.002m),
     ["gpt-5"] = (0.00125m, 0.01m),
@@ -44,7 +45,7 @@ var redisUrl = Environment.GetEnvironmentVariable("REDIS_URL");
 IResponseCache cache = string.IsNullOrWhiteSpace(redisUrl)
     ? new MemoryResponseCache()
     : new RedisResponseCache(redisUrl);
-var cacheStats = new CacheStats();
+var stats = new ServiceStats();
 
 // TTL це властивість класу запиту, а не одне число на все.
 // FAQ змінюється рідко, тому живе добу. Звичайні відповіді годину.
@@ -58,6 +59,12 @@ var cacheTtlByTier = new Dictionary<string, TimeSpan>
 var cacheTtlOverride = int.TryParse(Environment.GetEnvironmentVariable("CACHE_TTL_SECONDS"), out var ttlSeconds)
     ? TimeSpan.FromSeconds(ttlSeconds)
     : (TimeSpan?)null;
+
+// надійність (W4): запобіжник на кожну модель і таймаут одного виклику.
+// BREAKER_HALF_OPEN=false лише для перевірки, як поводиться запобіжник без пробних запитів.
+var breakers = new ConcurrentDictionary<string, Breaker>();
+var breakerHalfOpen = Environment.GetEnvironmentVariable("BREAKER_HALF_OPEN") != "false";
+var modelTimeout = TimeSpan.FromSeconds(10);
 
 // реєстр інструментів (W3) як дані, а не switch. Модель лише просить інструмент,
 // виконує сервіс і лише те, що є в цій таблиці. Кожен запис має схему аргументів, категорію і таймаут.
@@ -131,74 +138,80 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     {
         // hit: модель не викликаємо. Нульові токени і cost_usd = 0 у лозі доводять влучання,
         // а не мала затримка, бо на mock промах теж займає мілісекунди.
-        var hits = Interlocked.Increment(ref cacheStats.Hits);
-        logger.LogInformation("cache hit, hits {Hits}, misses {Misses}", hits, Interlocked.Read(ref cacheStats.Misses));
+        var hits = Interlocked.Increment(ref stats.Hits);
+        logger.LogInformation("cache hit, hits {Hits}, misses {Misses}", hits, Interlocked.Read(ref stats.Misses));
         var hitLatencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-        await LogRequest(dbConn, requestId, model, tier, source, promptVersion, hitLatencyMs, 0, 0, 0m, 200);
+        await LogRequest(dbConn, requestId, model, tier, source, promptVersion, hitLatencyMs, 0, 0, 0m, 200, 1, null);
         return Results.Json(new { request_id = requestId, content = cachedAnswer, tool = (string?)null, latency_ms = hitLatencyMs, cache = "hit" });
     }
 
-    var misses = Interlocked.Increment(ref cacheStats.Misses);
-    logger.LogInformation("cache miss, hits {Hits}, misses {Misses}", Interlocked.Read(ref cacheStats.Hits), misses);
+    var misses = Interlocked.Increment(ref stats.Misses);
+    logger.LogInformation("cache miss, hits {Hits}, misses {Misses}", Interlocked.Read(ref stats.Hits), misses);
 
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
-        {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = body.Message }
-        }
-    });
-
+    // fallback (W4): пробуємо ланцюг по черзі. Кожен виклик моделі це окремий рядок у requests
+    // з тим самим request_id і своїм attempt, тож невдалі спроби лишаються в лозі поруч із 200.
+    // Відкритий запобіжник пропускає модель одразу, без мережевого виклику.
+    var chain = FallbackChain(model, tier, defaultModel);
     var http = httpFactory.CreateClient();
-    var answer = "";
-    string? toolCall = null;
-    var toolArgs = "{}";
-    int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
-    var usageKnown = false;  // без usage вартість невідома, і це null, а не нуль
-    try
+    GatewayResult? result = null;
+    decimal? costUsd = null;
+    var attempted = false;
+    for (var i = 0; i < chain.Length && result is not { Ok: true }; i++)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
+        var breaker = breakers.GetOrAdd(chain[i], _ => new Breaker());
+        if (!breaker.TryPass(DateTimeOffset.UtcNow, breakerHalfOpen)) continue;
 
-        using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        answer = message.GetProperty("content").GetString() ?? "";
+        // перехід до наступної моделі. Користувач його може не помітити, а система мусить зафіксувати.
+        if (i > 0) Interlocked.Increment(ref stats.Fallbacks);
+        attempted = true;
 
-        // tools (W3): модель лише просить інструмент, тут читаємо назву й аргументи.
-        // Виконання нижче, після usage, щоб збій інструмента не зіпсував облік вартості.
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        var attempt = await Reliability.CallGateway(http, gateway, chain[i], systemPrompt, body.Message, modelTimeout);
+        breaker.Record(attempt.Ok, DateTimeOffset.UtcNow);
+
+        // cost (W2): usage з відповіді, ціна за моделлю з прайсу. Нема тарифу або usage, буде null.
+        // Нуль лишаємо для випадку, коли виклику справді не було (cache-hit з W3).
+        // Округлення до 6 знаків як у колонці NUMERIC(10, 6).
+        var attemptCost = attempt.UsageKnown && prices.TryGetValue(chain[i], out var price)
+            ? Math.Round(attempt.PromptTokens / 1000m * price.In + attempt.CompletionTokens / 1000m * price.Out, 6)
+            : (decimal?)null;
+        await LogRequest(dbConn, requestId, chain[i], tier, source, promptVersion, attempt.LatencyMs,
+            attempt.PromptTokens, attempt.CompletionTokens, attemptCost, attempt.Status, i + 1, attempt.ErrorKind);
+
+        if (attempt.Ok)
         {
-            var function = tools[0].GetProperty("function");
-            toolCall = function.GetProperty("name").GetString();
-            toolArgs = function.TryGetProperty("arguments", out var a) ? a.GetString() ?? "{}" : "{}";
+            // у лог і далі йде модель, яка реально відповіла, а не та, яку обрав роутер
+            model = chain[i];
+            costUsd = attemptCost;
         }
-
-        var usage = doc.RootElement.GetProperty("usage");
-        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
-        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
-        usageKnown = true;
+        result = attempt;
     }
-    catch
+
+    var ok = result is { Ok: true };
+    var answer = ok ? result!.Answer : "";
+    var toolCall = ok ? result!.Tool : null;
+    if (!ok)
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
-        // TODO(student, W4): тут краще graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        // усі моделі ланцюга впали або їхні запобіжники відкриті. Остання сходинка деградації
+        // це ввічлива відповідь і шлях до людини. Текст для людини, а статус для машин.
+        // Користувач отримує 200 і живий чат, а в лозі чесний 503, інакше моніторинг бачить здорову систему.
+        // Жодних вигаданих фактів, ні статусу замовлення, ні номера тікета.
+        answer = "Вибачте, тимчасові проблеми на нашому боці. Спробуйте, будь ласка, трохи згодом. "
+            + "Якщо питання термінове, напишіть оператору підтримки.";
+        if (!attempted)
+        {
+            // жодного виклику не було, бо всі запобіжники відкриті. Звернення однаково лишає слід.
+            await LogRequest(dbConn, requestId, chain[0], tier, source, promptVersion,
+                (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds, 0, 0, 0m, 503, 1, "circuit_open");
+        }
+        logger.LogWarning("all models failed for request {RequestId}, chain {Chain}", requestId, string.Join(" -> ", chain));
     }
 
     // виконуємо інструмент і підклеюємо результат до відповіді. Таймаут і помилка це оброблені гілки,
     // користувач отримує чесну примітку замість зависання чи 500.
-    if (toolCall is not null && status == 200)
+    if (ok && toolCall is not null)
     {
         var spec = toolRegistry.GetValueOrDefault(toolCall);
-        var outcome = await ToolRuntime.ExecuteTool(spec, toolCall, toolArgs, new ToolContext(requestId, body.ConversationId, body.Message), dbConn, logger);
+        var outcome = await ToolRuntime.ExecuteTool(spec, toolCall, result!.ToolArgs, new ToolContext(requestId, body.ConversationId, body.Message), dbConn, logger);
         answer += ToolRuntime.ToolNote(spec, outcome);
     }
 
@@ -209,7 +222,7 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     // 2. Ескалації, тобто повернення і скарги. Кожна унікальна, і для них немає TTL.
     // 3. Помилки й заглушки (не 200, без usage). Інакше збій жив би до кінця TTL.
     // 4. Відповідь на резервному промпті (версія none). Реєстр зламаний, і відповідь лише заглушка.
-    if (cacheTtl is { } ttl && status == 200 && usageKnown && toolCall is null && promptVersion != "none" && answer.Length > 0)
+    if (cacheTtl is { } ttl && ok && toolCall is null && promptVersion != "none" && answer.Length > 0)
     {
         try
         {
@@ -220,16 +233,6 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
             logger.LogWarning(ex, "cache write failed for request {RequestId}", requestId);
         }
     }
-
-    // cost (W2): usage з відповіді, ціна за моделлю з прайсу. Нема тарифу або usage, буде null.
-    // Нуль лишаємо для випадку, коли виклику справді не було (cache-hit з W3).
-    // Округлення до 6 знаків як у колонці NUMERIC(10, 6).
-    decimal? costUsd = usageKnown && prices.TryGetValue(model, out var price)
-        ? Math.Round(promptTokens / 1000m * price.In + completionTokens / 1000m * price.Out, 6)
-        : null;
-
-    // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, tier, source, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
     // budget policy (W2): поріг 80% за клієнтськими витратами дає алерт у лог, див. рядок біля Route().
     // Перевіряємо лише після платного клієнтського виклику. Тільки він збільшує суму, тож
@@ -254,21 +257,22 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         }
     }
 
-    return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs, cache = "miss" });
+    return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs, cache = "miss", degraded = !ok });
 });
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-// W3: поки лише лічильники кешу з памʼяті процесу, тож після рестарту вони з нуля.
-// W5 порахує все з таблиці requests: p95_ms, error_rate_pct, fallback_events.
+// W3 і W4: лічильники кешу та переходів fallback з памʼяті процесу, тож після рестарту вони з нуля.
+// W5 порахує все з таблиці requests: p95_ms, error_rate_pct, а fallback_events з колонки attempt.
 app.MapGet("/observability", () =>
 {
-    var hits = Interlocked.Read(ref cacheStats.Hits);
-    var total = hits + Interlocked.Read(ref cacheStats.Misses);
+    var hits = Interlocked.Read(ref stats.Hits);
+    var total = hits + Interlocked.Read(ref stats.Misses);
     return Results.Json(new
     {
         requests = total,
         cache_hit_pct = total == 0 ? (double?)null : Math.Round(100.0 * hits / total, 1),
+        fallback_events = Interlocked.Read(ref stats.Fallbacks),
     });
 });
 // W2: витрати за сьогодні з БД плюс бюджет. Без БД 503, а не нуль, бо нуль збреше плитці.
@@ -371,12 +375,22 @@ app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals
 
 app.Run("http://0.0.0.0:8080");
 
-// fallback chain: escalation mock-strong -> claude-opus-5-5 -> тікет на оператора; faq, standard mock-mini -> claude-haiku-4-5 -> контрольована помилка
-// Другий крок завжди інший провайдер. mock-mini і mock-strong живуть на одному
-// mock-provider і падають разом, тож перехід між ними від падіння не рятує.
+// fallback chain: на mock-стенді основна mock-модель -> mock; з реальним ключем escalation MODEL -> claude-opus-5-5, faq і standard MODEL -> claude-haiku-4-5; усі впали -> ввічлива заглушка зі шляхом до людини
+// З реальним ключем другий крок завжди інший провайдер. mock-mini і mock-strong живуть на одному
+// mock-provider і падають разом, тож у бою перехід між ними від падіння не рятує.
 // Ескалацію не спускаємо на слабшу модель. Повернення і скарги краще віддати людині.
 // budget policy: на 80% денного бюджету за клієнтськими витратами (source = user) пишемо алерт у лог і маршрут не міняємо, бо faq і standard уже на найдешевшій моделі, а ескалацію свідомо не здешевлюємо.
 // Evals у поріг не входять. Політика керує маршрутом клієнтів, і прогін у CI не повинен їх різати. Свій ліміт для evals буде на W6.
+static string[] FallbackChain(string primary, string tier, string defaultModel)
+{
+    // на mock обидва елементи йдуть в один mock-provider, тож справжній перехід на незалежну модель
+    // тут не відтворити. Механіка переходу та сама, і з реальним ключем ланцюг підставиться без змін.
+    string[] chain = defaultModel == "mock"
+        ? [primary, "mock"]
+        : [primary, tier == "escalation" ? "claude-opus-5-5" : "claude-haiku-4-5"];
+    return chain.Distinct().ToArray();
+}
+
 static (string Model, string Tier) Route(string message, string defaultModel)
 {
     var tier = Tier(message);
@@ -472,15 +486,15 @@ static async Task<(string Body, string Version)> GetActivePrompt(string conn)
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
 static async Task LogRequest(string conn, Guid id, string model, string tier, string source, string promptVersion, int latency,
-    int promptTokens, int completionTokens, decimal? cost, int status)
+    int promptTokens, int completionTokens, decimal? cost, int status, int attempt, string? errorKind)
 {
     try
     {
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, tier, source, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @tier, @source, @pv, @lat, @pt, @ct, @cost, @status)", db);
+            "INSERT INTO requests (request_id, model, tier, source, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status, attempt, error_kind) "
+            + "VALUES (@id, @model, @tier, @source, @pv, @lat, @pt, @ct, @cost, @status, @attempt, @err)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
         cmd.Parameters.AddWithValue("tier", tier);
@@ -491,6 +505,8 @@ static async Task LogRequest(string conn, Guid id, string model, string tier, st
         cmd.Parameters.AddWithValue("ct", completionTokens);
         cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
         cmd.Parameters.AddWithValue("status", status.ToString());
+        cmd.Parameters.AddWithValue("attempt", (short)attempt);
+        cmd.Parameters.AddWithValue("err", (object?)errorKind ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync();
     }
     catch { /* не валимо запит через лог */ }
@@ -558,10 +574,11 @@ class RedisResponseCache : IResponseCache
         redis.GetDatabase().StringSetAsync(Prefix + key, answer, ttl);
 }
 
-// лічильники кешу. Поля, а не властивості, бо Interlocked потребує ref.
-// У консолі вони зʼявляться на W5, а поки їх видно в лозі процесу.
-class CacheStats
+// лічильники сервісу у памʼяті процесу. Поля, а не властивості, бо Interlocked потребує ref.
+// Fallbacks росте на кожному переході до наступної моделі ланцюга (W4).
+class ServiceStats
 {
     public long Hits;
     public long Misses;
+    public long Fallbacks;
 }

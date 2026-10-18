@@ -16,7 +16,12 @@ CREATE TABLE IF NOT EXISTS requests (
     prompt_tokens   INTEGER,
     completion_tokens INTEGER,
     cost_usd        NUMERIC(10, 6),
-    status          TEXT
+    status          TEXT,
+    -- позиція моделі в fallback-ланцюгу. attempt > 1 означає, що основна модель не впоралась.
+    attempt         SMALLINT NOT NULL DEFAULT 1,
+    -- тип збою, NULL для успіху. status, timeout, network, bad_response або circuit_open.
+    -- Без нього таймаут і розрив зʼєднання в лозі виглядали б однаково.
+    error_kind      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompts (
