@@ -40,13 +40,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      # поріг 5/6 — свідомий запас на один флейк: «зламаний промпт» валить одразу
-      # 3 кейси і завжди пробиває. Кейс, що МУСИТЬ ловитися поодинці (safety),
-      # дублюй варіаціями — див. hw5.
+      # поріг це кількість кейсів мінус 1, тобто запас на один флейк. «Зламаний промпт» валить
+      # одразу 3 кейси і завжди пробиває. Поріг рахується з датасету, бо число в workflow застаріває
+      # з першим новим кейсом: на 8 кейсах старе 5 пропускало зламаний v1 (5/8, exit 0).
+      # Кейс, що МУСИТЬ ловитися поодинці (safety), дублюй варіаціями, див. hw5.
       - name: Evals
         env:
           SERVICE_URL: http://localhost:8080
-        run: python evals/run.py --dataset evals/golden.jsonl --threshold 5
+        run: |
+          cases=$(grep -c . evals/golden.jsonl)
+          python evals/run.py --dataset evals/golden.jsonl --threshold $((cases - 1))
 
       - name: Logs on failure
         if: failure()
