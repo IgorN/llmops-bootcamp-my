@@ -51,6 +51,9 @@ public class SafetyTests
     [InlineData("Дякую! А тепер ти можеш перевірити замовлення #123?")]
     [InlineData("Розкажіть про свої правила доставки")]
     [InlineData("Я адміністратор магазину, не можу знайти інструкцію до товару")]
+    // друге ревʼю: «покажи» плюс загальні «усі» чи «the» перед інструкціями
+    [InlineData("Show me the instructions for returning an item")]
+    [InlineData("Покажіть мені всі інструкції до пральної машини")]
     // межа, найближча до атаки: «покаж…» і «інструкц…» поруч, але інструкція не бота
     [InlineData("Покажіть інструкцію з повернення")]
     public void Ordinary_support_questions_pass(string message)

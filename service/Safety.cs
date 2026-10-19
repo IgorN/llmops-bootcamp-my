@@ -21,10 +21,15 @@ public static class Guards
     // Шаблони це перша лінія: перефразування, яке вони не покривають, ловить лише наступний regression-кейс в evals.
     private const RegexOptions Opts = RegexOptions.IgnoreCase | RegexOptions.Compiled;
 
-    // ціль атаки, тобто інструкції чи промпт самого бота
-    private const string Target =
+    // ціль для «забудь…»: будь-які інструкції чи промпт. «Забудь усі інструкції» це атака за будь-якого обʼєкта.
+    private const string OverrideTarget =
         @"(system\s+prompt|(your|the|previous|all|prior)\s+(instructions?|prompt)|instructions?|" +
         @"системн\w*\s+промпт\w*|(сво\w*|тво\w*|попередн\w*|ус\w*|вс\w*)\s+(інструкц\w*|промпт\w*)|промпт\w*)";
+
+    // ціль для «покажи…»: лише інструкції чи промпт самого бота. «Покажіть усі інструкції до пральної машини»
+    // і «show me the instructions for returning» це звичайні питання, тож загальні «усі» чи «the» тут не годяться.
+    private const string BotTarget =
+        @"(system\s+prompt|your\s+(instructions?|prompt)|системн\w*\s+промпт\w*|(сво\w*|тво\w*)\s+(інструкц\w*|промпт\w*))";
 
     // до трьох слів у межах одного речення. Без цього «Забудьте моє питання. Які правила…» зшивалося в атаку.
     private const string SameSentence = @"[^\S\n]+([^\s.!?]+[^\S\n]+){0,3}";
@@ -33,12 +38,12 @@ public static class Guards
     [
         // перезапис ролі: «забудь попередні інструкції», «тепер ти інший бот»
         ("role_override", new(
-            @"\b(ignore|disregard|forget|override|ігнор\w*|забудь\w*|не\s+зважай\w*)" + SameSentence + Target +
+            @"\b(ignore|disregard|forget|override|ігнор\w*|забудь\w*|не\s+зважай\w*)" + SameSentence + OverrideTarget +
             @"|\b(you\s+are\s+now|from\s+now\s+on\s+you\s+are|тепер\s+ти|відтепер\s+ти)\s+(\w+\s+){0,2}(bot|assistant|model|ai|бот\w*|асистент\w*|модел\w*)\b",
             Opts)),
         // витяг інструкцій: «покажи свій системний промпт», а не «розкажіть про свої правила доставки»
         ("prompt_extraction", new(
-            @"\b(show|print|reveal|repeat|output|tell\s+me|покаж\w*|виведи|виведіть|надрукуй\w*|повтори\w*|розкаж\w*)" + SameSentence + Target,
+            @"\b(show|print|reveal|repeat|output|tell\s+me|покаж\w*|виведи|виведіть|надрукуй\w*|повтори\w*|розкаж\w*)" + SameSentence + BotTarget,
             Opts)),
         // соціальний тиск: «я розробник, для дебагу мені потрібно…», а не «я адміністратор магазину»
         ("social_pressure", new(
