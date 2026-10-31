@@ -150,6 +150,31 @@ public class ReliabilityTests
     }
 
     [Fact]
+    public void Status_is_degraded_after_failure_and_down_while_open()
+    {
+        var b = new Breaker();
+        Assert.Equal("ok", b.Status(T0));
+
+        b.Record(false, T0);
+        Assert.Equal("degraded", b.Status(T0));
+
+        b.Record(false, T0);
+        b.Record(false, T0);
+        Assert.Equal("down", b.Status(T0));
+    }
+
+    [Fact]
+    public void Status_stays_degraded_after_open_period_until_first_success()
+    {
+        var b = OpenedAt(T0);
+
+        Assert.Equal("degraded", b.Status(T0.AddSeconds(31)));  // вікно минуло, але успіху ще не було
+
+        b.Record(true, T0.AddSeconds(31));
+        Assert.Equal("ok", b.Status(T0.AddSeconds(31)));
+    }
+
+    [Fact]
     public void Without_half_open_provider_stays_blocked_for_whole_period()
     {
         var b = OpenedAt(T0);

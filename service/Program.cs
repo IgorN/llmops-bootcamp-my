@@ -46,6 +46,7 @@ IResponseCache cache = string.IsNullOrWhiteSpace(redisUrl)
     ? new MemoryResponseCache()
     : new RedisResponseCache(redisUrl);
 var stats = new ServiceStats();
+var processStartedAt = DateTimeOffset.UtcNow;  // початок вікна лічильників у памʼяті
 
 // TTL це властивість класу запиту, а не одне число на все.
 // FAQ змінюється рідко, тому живе добу. Звичайні відповіді годину.
@@ -107,6 +108,7 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     // тож вона не залежить ні від промпта, ні від провайдера. Кожне спрацювання це подія в лозі.
     if (Guards.InjectionFamily(message) is { } family)
     {
+        ErrorTaxonomy.Count(ErrorTaxonomy.GuardrailRefusal);
         logger.LogWarning("guardrail: injection, family {Family}, request {RequestId}", family, requestId);
         return Results.Json(new { request_id = requestId, content = "Не можу допомогти з цим запитом.", tool = (string?)null,
             latency_ms = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds, cache = "miss", guardrail = "injection" });
@@ -125,6 +127,7 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     }
     catch (Exception ex)
     {
+        ErrorTaxonomy.Count(ErrorTaxonomy.DbFailure);
         logger.LogError(ex, "prompt registry unavailable, request {RequestId} rejected", requestId);
         return Results.Json(
             new { request_id = requestId, error = "prompt registry unavailable" },
@@ -178,12 +181,13 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         var breaker = breakers.GetOrAdd(chain[i], _ => new Breaker());
         if (!breaker.TryPass(DateTimeOffset.UtcNow, breakerHalfOpen)) continue;
 
-        // перехід до наступної моделі. Користувач його може не помітити, а система мусить зафіксувати.
-        if (i > 0) Interlocked.Increment(ref stats.Fallbacks);
+        // перехід до наступної моделі користувач може не помітити, а система фіксує його рядком з attempt > 1.
+        // З цих рядків /observability рахує fallback_events.
         attempted = true;
 
         var attempt = await Reliability.CallGateway(http, gateway, chain[i], systemPrompt, message, modelTimeout);
         breaker.Record(attempt.Ok, DateTimeOffset.UtcNow);
+        if (attempt.Status == 429) ErrorTaxonomy.Count(ErrorTaxonomy.Provider429);
 
         // cost (W2): usage з відповіді, ціна за моделлю з прайсу. Нема тарифу або usage, буде null.
         // Нуль лишаємо для випадку, коли виклику справді не було (cache-hit з W3).
@@ -282,6 +286,7 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         }
         catch (Exception ex)
         {
+            ErrorTaxonomy.Count(ErrorTaxonomy.DbFailure);
             logger.LogError(ex, "budget check failed for request {RequestId}", requestId);
         }
     }
@@ -291,19 +296,52 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-// W3 і W4: лічильники кешу та переходів fallback з памʼяті процесу, тож після рестарту вони з нуля.
-// W5 порахує все з таблиці requests: p95_ms, error_rate_pct, а fallback_events з колонки attempt.
-app.MapGet("/observability", () =>
+// W5: усе за сьогодні з таблиці requests, тож плитки переживають рестарт і збігаються з psql.
+// Рядок у requests це виклик моделі, а не звернення. Тому requests рахує виклики, і error rate теж:
+// основна модель впала, fallback урятував відповідь, а збій провайдера однаково видно.
+// fallback_events звідси ж, це рядки з attempt > 1. Лічильник у памʼяті обнулявся б з кожним ребілдом
+// і жив би в іншому вікні часу, ніж плитки поруч.
+// source не фільтруємо, щоб плитки збігались із запитом ментора в psql.
+// cache-hit лишається в памʼяті (W3), бо в лозі влучання не має окремої позначки.
+// COALESCE потрібен для порожнього дня. Без нього свіжий стек віддавав би помилку ще до першого запиту.
+app.MapGet("/observability", async (ILogger<Program> logger) =>
 {
-    var hits = Interlocked.Read(ref stats.Hits);
-    var total = hits + Interlocked.Read(ref stats.Misses);
-    return Results.Json(new
+    try
     {
-        requests = total,
-        cache_hit_pct = total == 0 ? (double?)null : Math.Round(100.0 * hits / total, 1),
-        fallback_events = Interlocked.Read(ref stats.Fallbacks),
-    });
+        await using var db = new NpgsqlConnection(dbConn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT count(*), "
+            + "COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0), "
+            + "COALESCE(AVG(CASE WHEN status <> '200' THEN 1.0 ELSE 0 END) * 100, 0), "
+            + "count(*) FILTER (WHERE attempt > 1) "
+            + "FROM requests WHERE created_at::date = CURRENT_DATE", db);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        await reader.ReadAsync();
+
+        var hits = Interlocked.Read(ref stats.Hits);
+        var total = hits + Interlocked.Read(ref stats.Misses);
+        return Results.Json(new
+        {
+            // округлення як у round() в psql, щоб звірка йшла цифра в цифру
+            p95_ms = (int)Math.Round(reader.GetDouble(1)),
+            requests = reader.GetInt64(0),
+            cache_hit_pct = total == 0 ? 0 : Math.Round(100.0 * hits / total, 1),
+            error_rate_pct = Math.Round(reader.GetDecimal(2), 1, MidpointRounding.AwayFromZero),
+            fallback_events = reader.GetInt64(3),
+        });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "failed to read observability aggregates");
+        return Results.Json(new { error = "observability unavailable" },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
 });
+// W5 опційно: таксономія збоїв, див. ErrorTaxonomy. Окремий ендпоінт, а не поле в /observability,
+// бо /observability без бази віддає 503, і db_failure зник би саме тоді, коли він потрібен.
+// Збої ендпоінтів консолі сюди не йдуть. Консоль опитує їх кожні 4 с, і лічильник міряв би опитування, а не клієнтів.
+app.MapGet("/errors", () => Results.Json(new { since = processStartedAt, by_kind = ErrorTaxonomy.Snapshot() }));
 // W2: витрати за сьогодні з БД плюс бюджет. Без БД 503, а не нуль, бо нуль збреше плитці.
 app.MapGet("/cost", async (ILogger<Program> logger) =>
 {
@@ -399,7 +437,21 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpContext ct
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 });
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
+// W5: статус кожної моделі ланцюга з її запобіжника (W4). Сигнал дає fallback-цикл, де кожен виклик пише Record.
+// Список моделей відомий наперед, тож картка жива з першого запуску. Модель, яку ще не викликали, має ok.
+// Кешована відповідь модель не викликає і статус не оновлює.
+// Резервну модель кличуть лише після збою основної, тож її degraded тримається до наступного виклику.
+// Це чесно, бо успіху після збою ще ніхто не бачив.
+app.MapGet("/providers", () =>
+{
+    var now = DateTimeOffset.UtcNow;
+    var providers = KnownModels(defaultModel).Select(name => new
+    {
+        name,
+        status = breakers.TryGetValue(name, out var breaker) ? breaker.Status(now) : "ok",
+    });
+    return Results.Json(new { providers });
+});
 // W4: черга заявок. pending читає консоль, а виконані лишаються в done з результатом,
 // щоб після approve було видно номер тікета і що він рівно один.
 app.MapGet("/approvals", () =>
@@ -452,13 +504,24 @@ static string[] FallbackChain(string primary, string tier, string defaultModel)
 static (string Model, string Tier) Route(string message, string defaultModel)
 {
     var tier = Tier(message);
+    return (PrimaryModel(tier, defaultModel), tier);
+}
 
+static string PrimaryModel(string tier, string defaultModel)
+{
     // MODEL не mock означає реальну модель. Її лишаємо як є, а tier тільки пишемо в лог.
-    if (defaultModel != "mock") return (defaultModel, tier);
+    if (defaultModel != "mock") return defaultModel;
 
     // faq поки йде на mock-mini. На W3 його підхопить кеш.
-    return (tier == "escalation" ? "mock-strong" : "mock-mini", tier);
+    return tier == "escalation" ? "mock-strong" : "mock-mini";
 }
+
+// усі моделі, до яких може піти запит на цьому стенді, у порядку ланцюгів
+static string[] KnownModels(string defaultModel) =>
+    new[] { "faq", "standard", "escalation" }
+        .SelectMany(tier => FallbackChain(PrimaryModel(tier, defaultModel), tier, defaultModel))
+        .Distinct()
+        .ToArray();
 
 // tier-політика. Ескалацію перевіряємо першою, бо вона сильніша за FAQ.
 // «поверніть гроші, не працює вхід» має піти на сильну модель.
@@ -567,7 +630,12 @@ static async Task LogRequest(string conn, Guid id, string model, string tier, st
         cmd.Parameters.AddWithValue("err", (object?)errorKind ?? DBNull.Value);
         await cmd.ExecuteNonQueryAsync();
     }
-    catch { /* не валимо запит через лог */ }
+    catch
+    {
+        // запит не валимо, але й мовчки не губимо. Рядка в requests немає, тож плитки з бази цей запит не побачать,
+        // і лише лічильник покаже, що лог неповний.
+        ErrorTaxonomy.Count(ErrorTaxonomy.DbFailure);
+    }
 }
 
 // conversation_id необовʼязковий. UI його не шле, тому ключ ідемпотентності тоді привʼязаний до request_id.
@@ -632,11 +700,10 @@ class RedisResponseCache : IResponseCache
         redis.GetDatabase().StringSetAsync(Prefix + key, answer, ttl);
 }
 
-// лічильники сервісу у памʼяті процесу. Поля, а не властивості, бо Interlocked потребує ref.
-// Fallbacks росте на кожному переході до наступної моделі ланцюга (W4).
+// лічильники кешу у памʼяті процесу. Поля, а не властивості, бо Interlocked потребує ref.
+// Переходи fallback тут більше не рахуємо, з W5 їх рахує /observability з колонки attempt.
 class ServiceStats
 {
     public long Hits;
     public long Misses;
-    public long Fallbacks;
 }

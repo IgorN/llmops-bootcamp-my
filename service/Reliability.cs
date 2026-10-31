@@ -1,6 +1,7 @@
 // надійність (W4): один виклик моделі як значення і запобіжник на кожну модель.
 // Винесено з Program.cs, щоб покрити юніт-тестами.
 
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 
@@ -96,6 +97,13 @@ public class Breaker
         lock (gate) return openUntil > now;
     }
 
+    // статус для консолі (W5). down, поки запобіжник відкритий. degraded, коли останні виклики падали,
+    // зокрема після кінця вікна open, бо успіху ще не було. ok повертає перший успішний виклик.
+    public string Status(DateTimeOffset now)
+    {
+        lock (gate) return openUntil > now ? "down" : fails > 0 ? "degraded" : "ok";
+    }
+
     // чи можна зараз звернутись до моделі
     public bool TryPass(DateTimeOffset now, bool halfOpen)
     {
@@ -125,4 +133,29 @@ public class Breaker
             }
         }
     }
+}
+
+// таксономія збоїв (W5): окремий лічильник на кожну причину, бо кожна веде до своєї дії.
+// provider_429 означає вичерпані ліміти, тож розводимо трафік і домовляємось про квоту.
+// tool_timeout означає, що не відповіла зовнішня система, і лагодити треба інтеграцію, а не модель.
+// guardrail_refusal це успіх захисту, а не збій, тому в error rate його немає.
+// db_failure означає, що лог неповний і плитки з бази показують менше, ніж було насправді.
+// Лічильники в памʼяті процесу, бо збій бази в самій базі не порахувати. Тож вікно тут від старту процесу, а не за день.
+// Статичний клас, бо рахують і /chat, і ToolRuntime, а тягнути лічильник у кожен їхній виклик заради цього зайве.
+public static class ErrorTaxonomy
+{
+    public const string Provider429 = "provider_429";
+    public const string ToolTimeout = "tool_timeout";
+    public const string GuardrailRefusal = "guardrail_refusal";
+    public const string DbFailure = "db_failure";
+
+    // усі причини з нулем від старту, щоб «не було жодного» відрізнялось від «не рахується»
+    private static readonly ConcurrentDictionary<string, long> Counts = new(
+        new[] { Provider429, ToolTimeout, GuardrailRefusal, DbFailure }.Select(k => KeyValuePair.Create(k, 0L)));
+
+    public static void Count(string kind) => Counts.AddOrUpdate(kind, 1, (_, n) => n + 1);
+
+    public static long Get(string kind) => Counts.GetValueOrDefault(kind);
+
+    public static IReadOnlyDictionary<string, long> Snapshot() => new SortedDictionary<string, long>(Counts);
 }
