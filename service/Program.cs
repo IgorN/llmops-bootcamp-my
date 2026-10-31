@@ -186,7 +186,9 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         attempted = true;
 
         var attempt = await Reliability.CallGateway(http, gateway, chain[i], systemPrompt, message, modelTimeout);
-        breaker.Record(attempt.Ok, DateTimeOffset.UtcNow);
+        // garbage у запобіжник не пишемо. Провайдер відповів, тож він живий, а порожня відповідь стосується
+        // одного питання. Інакше три такі питання вимкнули б модель для всіх клієнтів.
+        if (attempt.ErrorKind != "garbage") breaker.Record(attempt.Ok, DateTimeOffset.UtcNow);
         if (attempt.Status == 429) ErrorTaxonomy.Count(ErrorTaxonomy.Provider429);
 
         // cost (W2): usage з відповіді, ціна за моделлю з прайсу. Нема тарифу або usage, буде null.
@@ -308,8 +310,10 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 // W5: усе за сьогодні з таблиці requests, тож плитки переживають рестарт і збігаються з psql.
-// Рядок у requests це виклик моделі, а не звернення. Тому requests рахує виклики, і error rate теж:
-// основна модель впала, fallback урятував відповідь, а збій провайдера однаково видно.
+// Плитки рахують рядки логу, а не звернення і не виклики моделі. Рядок пишуть виклик моделі, cache-hit
+// (0 токенів, latency кілька мс) і пропуск через відкритий запобіжник (circuit_open, 503), де моделі не кликали.
+// Тож requests це не навантаження на провайдера, для нього є фільтр error_kind і токени.
+// error rate теж по рядках. Основна модель впала, fallback урятував відповідь, а збій провайдера однаково видно.
 // fallback_events звідси ж, це рядки з attempt > 1. Лічильник у памʼяті обнулявся б з кожним ребілдом
 // і жив би в іншому вікні часу, ніж плитки поруч.
 // source не фільтруємо, щоб плитки збігались із запитом ментора в psql.
@@ -448,7 +452,7 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpContext ct
             statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 });
-// W5: статус кожної моделі ланцюга з її запобіжника (W4). Сигнал дає fallback-цикл, де кожен виклик пише Record.
+// W5: статус кожної моделі ланцюга з її запобіжника (W4). Сигнал дає fallback-цикл, де кожен виклик, крім garbage, пише Record.
 // Список моделей відомий наперед, тож картка жива з першого запуску. Модель, яку ще не викликали, має ok.
 // Кешована відповідь модель не викликає і статус не оновлює.
 // Резервну модель кличуть лише після збою основної, тож її degraded тримається до наступного виклику.
