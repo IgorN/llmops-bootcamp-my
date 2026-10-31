@@ -59,9 +59,11 @@ public class ToolRuntimeTests
         var spec = new ToolSpec(ToolCategory.ReadOnly, TimeSpan.FromMilliseconds(200), """{"type":"object","properties":{}}""",
             async (_, _, _) => { await Task.Delay(TimeSpan.FromSeconds(5)); return "запізно"; });
 
+        var before = ErrorTaxonomy.Get(ErrorTaxonomy.ToolTimeout);
         var (status, result, latency) = await ToolRuntime.RunWithTimeout(spec, Json("{}"), Ctx());
 
         Assert.Equal("timeout", status);
+        Assert.True(ErrorTaxonomy.Get(ErrorTaxonomy.ToolTimeout) > before);
         Assert.Null(result);
         Assert.InRange(latency, 150, 1500);
     }
@@ -75,11 +77,13 @@ public class ToolRuntimeTests
             (_, _, _) => { executed = true; return Task.FromResult("тікет"); },
             ActionId: Orders.TicketActionId);
 
+        var before = ErrorTaxonomy.Get(ErrorTaxonomy.DbFailure);
         var outcome = await ToolRuntime.ExecuteTool(spec, "create_ticket", "{}", Ctx("conv-1"), NoDb, NullLogger.Instance);
 
         Assert.Equal("error", outcome.Status);
         Assert.False(executed);
         Assert.Contains("оператор", ToolRuntime.ToolNote(spec, outcome));
+        Assert.True(ErrorTaxonomy.Get(ErrorTaxonomy.DbFailure) > before);  // збій бази не мовчазний
     }
 
     // сценарій з ревʼю: дві різні дії в одній розмові не склеюються, а та сама дія іншими словами склеюється

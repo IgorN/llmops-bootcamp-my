@@ -40,16 +40,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      # поріг це кількість кейсів мінус 1, тобто запас на один флейк. «Зламаний промпт» валить
-      # одразу 3 кейси і завжди пробиває. Поріг рахується з датасету, бо число в workflow застаріває
-      # з першим новим кейсом: на 8 кейсах старе 5 пропускало зламаний v1 (5/8, exit 0).
-      # Кейс, що МУСИТЬ ловитися поодинці (safety), дублюй варіаціями, див. hw5.
+      # поріг за правилом hw5 рахує evals/threshold.sh. До 10 кейсів N-1, далі 85% з округленням угору.
+      # На 16 кейсах це 14, тобто запас на два флейки. «Зламаний промпт» v1 валить 4 кейси і завжди пробиває.
+      # Поріг рахується з датасету, бо число в workflow застаріває з першим новим кейсом:
+      # на 8 кейсах старе 5 пропускало зламаний v1 (5/8, exit 0).
+      # Кейс, що МУСИТЬ ловитися поодинці (safety), дублюй варіаціями.
       - name: Evals
         env:
           SERVICE_URL: http://localhost:8080
-        run: |
-          cases=$(grep -c . evals/golden.jsonl)
-          python evals/run.py --dataset evals/golden.jsonl --threshold $((cases - 1))
+        run: python evals/run.py --dataset evals/golden.jsonl --threshold $(sh evals/threshold.sh evals/golden.jsonl)
 
       - name: Logs on failure
         if: failure()

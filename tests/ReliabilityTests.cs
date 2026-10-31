@@ -83,6 +83,31 @@ public class ReliabilityTests
         Assert.Equal((false, 200, "bad_response"), (r.Ok, r.Status, r.ErrorKind));
     }
 
+    [Theory]
+    [InlineData("...")]
+    [InlineData("")]
+    [InlineData("  ?! ")]
+    public async Task Answer_without_letters_is_garbage_but_keeps_usage(string content)
+    {
+        var body = $$$"""{"choices":[{"message":{"content":"{{{content}}}"}}],"usage":{"prompt_tokens":5,"completion_tokens":1}}""";
+
+        var r = await Call(new StubHandler(HttpStatusCode.OK, body));
+
+        Assert.Equal((false, 200, "garbage"), (r.Ok, r.Status, r.ErrorKind));
+        Assert.True(r.UsageKnown);  // провайдер токени порахував, тож і ми
+    }
+
+    [Fact]
+    public async Task Tool_call_without_text_is_not_garbage()
+    {
+        var body = """{"choices":[{"message":{"content":"","tool_calls":[{"function":{"name":"lookup_order","arguments":"{}"}}]}}],"usage":{"prompt_tokens":5,"completion_tokens":1}}""";
+
+        var r = await Call(new StubHandler(HttpStatusCode.OK, body));
+
+        Assert.True(r.Ok);
+        Assert.Equal("lookup_order", r.Tool);
+    }
+
     private static readonly DateTimeOffset T0 = new(2026, 10, 18, 12, 0, 0, TimeSpan.Zero);
 
     private static Breaker OpenedAt(DateTimeOffset at)
@@ -147,6 +172,31 @@ public class ReliabilityTests
         b.Record(false, T0.AddSeconds(5));
 
         Assert.True(b.IsOpen(T0.AddSeconds(34)));
+    }
+
+    [Fact]
+    public void Status_is_degraded_after_failure_and_down_while_open()
+    {
+        var b = new Breaker();
+        Assert.Equal("ok", b.Status(T0));
+
+        b.Record(false, T0);
+        Assert.Equal("degraded", b.Status(T0));
+
+        b.Record(false, T0);
+        b.Record(false, T0);
+        Assert.Equal("down", b.Status(T0));
+    }
+
+    [Fact]
+    public void Status_stays_degraded_after_open_period_until_first_success()
+    {
+        var b = OpenedAt(T0);
+
+        Assert.Equal("degraded", b.Status(T0.AddSeconds(31)));  // вікно минуло, але успіху ще не було
+
+        b.Record(true, T0.AddSeconds(31));
+        Assert.Equal("ok", b.Status(T0.AddSeconds(31)));
     }
 
     [Fact]

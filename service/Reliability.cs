@@ -1,12 +1,14 @@
 // надійність (W4): один виклик моделі як значення і запобіжник на кожну модель.
 // Винесено з Program.cs, щоб покрити юніт-тестами.
 
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 
 // результат одного виклику. Збій це значення, а не виняток, тому ланцюг може спробувати наступну модель.
 // ErrorKind розрізняє, що сталось: status (провайдер відповів 4xx/5xx), timeout, network (відповіді не було),
-// bad_response (відповідь не розпарсилась). Без нього таймаут і розрив зʼєднання в лозі виглядали б однаково.
+// bad_response (відповідь не розпарсилась), garbage (200 і валідний JSON, але змісту немає).
+// Без нього таймаут і розрив зʼєднання в лозі виглядали б однаково.
 public record GatewayResult(
     bool Ok, int Status, string? ErrorKind, string Answer, string? Tool, string ToolArgs,
     int PromptTokens, int CompletionTokens, bool UsageKnown, int LatencyMs);
@@ -58,8 +60,16 @@ public static class Reliability
             }
 
             var usage = doc.RootElement.GetProperty("usage");
-            return new GatewayResult(true, status, null, answer, tool, toolArgs,
-                usage.GetProperty("prompt_tokens").GetInt32(), usage.GetProperty("completion_tokens").GetInt32(), true, Elapsed());
+            var promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
+            var completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+
+            // W5: успішна, але непридатна відповідь це збій формату, а не успіх. Текст без жодної літери
+            // («...», порожньо) користувачу нічого не каже. Токени провайдер однаково порахував, тож usage лишаємо.
+            // Відповідь з інструментом може бути без тексту, її не чіпаємо.
+            if (tool is null && !answer.Any(char.IsLetter))
+                return new GatewayResult(false, status, "garbage", "", null, "{}", promptTokens, completionTokens, true, Elapsed());
+
+            return new GatewayResult(true, status, null, answer, tool, toolArgs, promptTokens, completionTokens, true, Elapsed());
         }
         catch (OperationCanceledException)
         {
@@ -96,6 +106,13 @@ public class Breaker
         lock (gate) return openUntil > now;
     }
 
+    // статус для консолі (W5). down, поки запобіжник відкритий. degraded, коли останні виклики падали,
+    // зокрема після кінця вікна open, бо успіху ще не було. ok повертає перший успішний виклик.
+    public string Status(DateTimeOffset now)
+    {
+        lock (gate) return openUntil > now ? "down" : fails > 0 ? "degraded" : "ok";
+    }
+
     // чи можна зараз звернутись до моделі
     public bool TryPass(DateTimeOffset now, bool halfOpen)
     {
@@ -125,4 +142,29 @@ public class Breaker
             }
         }
     }
+}
+
+// таксономія збоїв (W5): окремий лічильник на кожну причину, бо кожна веде до своєї дії.
+// provider_429 означає вичерпані ліміти, тож розводимо трафік і домовляємось про квоту.
+// tool_timeout означає, що не відповіла зовнішня система, і лагодити треба інтеграцію, а не модель.
+// guardrail_refusal це успіх захисту, а не збій, тому в error rate його немає.
+// db_failure означає, що лог неповний і плитки з бази показують менше, ніж було насправді.
+// Лічильники в памʼяті процесу, бо збій бази в самій базі не порахувати. Тож вікно тут від старту процесу, а не за день.
+// Статичний клас, бо рахують і /chat, і ToolRuntime, а тягнути лічильник у кожен їхній виклик заради цього зайве.
+public static class ErrorTaxonomy
+{
+    public const string Provider429 = "provider_429";
+    public const string ToolTimeout = "tool_timeout";
+    public const string GuardrailRefusal = "guardrail_refusal";
+    public const string DbFailure = "db_failure";
+
+    // усі причини з нулем від старту, щоб «не було жодного» відрізнялось від «не рахується»
+    private static readonly ConcurrentDictionary<string, long> Counts = new(
+        new[] { Provider429, ToolTimeout, GuardrailRefusal, DbFailure }.Select(k => KeyValuePair.Create(k, 0L)));
+
+    public static void Count(string kind) => Counts.AddOrUpdate(kind, 1, (_, n) => n + 1);
+
+    public static long Get(string kind) => Counts.GetValueOrDefault(kind);
+
+    public static IReadOnlyDictionary<string, long> Snapshot() => new SortedDictionary<string, long>(Counts);
 }

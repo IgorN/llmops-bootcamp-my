@@ -98,6 +98,7 @@ public static class ToolRuntime
         }
         catch (Exception ex)
         {
+            ErrorTaxonomy.Count(ErrorTaxonomy.DbFailure);
             logger.LogError(ex, "irreversible tool {Tool} not executed for request {RequestId}", name, ctx.RequestId);
             return new ToolOutcome("error", null);
         }
@@ -116,6 +117,8 @@ public static class ToolRuntime
         }
         catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
         {
+            // єдине місце, де інструмент упирається в таймаут, тож і рахуємо тут, для обох категорій
+            ErrorTaxonomy.Count(ErrorTaxonomy.ToolTimeout);
             return ("timeout", null, Elapsed());
         }
         catch
@@ -196,6 +199,7 @@ public static class ToolRuntime
         }
         catch (Exception ex)
         {
+            ErrorTaxonomy.Count(ErrorTaxonomy.DbFailure);
             logger.LogWarning(ex, "tool call log failed for request {RequestId}", ctx.RequestId);
         }
     }
