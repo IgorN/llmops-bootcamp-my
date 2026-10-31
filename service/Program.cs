@@ -195,8 +195,11 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
         var attemptCost = attempt.UsageKnown && prices.TryGetValue(chain[i], out var price)
             ? Math.Round(attempt.PromptTokens / 1000m * price.In + attempt.CompletionTokens / 1000m * price.Out, 6)
             : (decimal?)null;
+        // status у лозі описує, чим закінчився виклик, а не HTTP-код. 200 з непридатним тілом (bad_response, garbage)
+        // пишемо як 502, інакше error rate рахував би його успіхом.
+        var loggedStatus = !attempt.Ok && attempt.Status == 200 ? 502 : attempt.Status;
         await LogRequest(dbConn, requestId, chain[i], tier, source, promptVersion, attempt.LatencyMs,
-            attempt.PromptTokens, attempt.CompletionTokens, attemptCost, attempt.Status, i + 1, attempt.ErrorKind);
+            attempt.PromptTokens, attempt.CompletionTokens, attemptCost, loggedStatus, i + 1, attempt.ErrorKind);
 
         if (attempt.Ok)
         {
@@ -210,7 +213,15 @@ app.MapPost("/chat", async (ChatIn body, HttpContext ctx, IHttpClientFactory htt
     var ok = result is { Ok: true };
     var answer = ok ? result!.Answer : "";
     var toolCall = ok ? result!.Tool : null;
-    if (!ok)
+    if (result is { ErrorKind: "garbage" })
+    {
+        // остання модель ланцюга відповіла, але без змісту. Це не простій, тож заглушка «тимчасові проблеми»
+        // тут збрехала б. Чесно кажемо, що відповіді немає, і даємо шлях далі. Текст свідомо інший,
+        // щоб evals відрізняли сміття від outage.
+        answer = "Не вдалося сформувати змістовну відповідь. Переформулюйте, будь ласка, питання або зверніться до оператора.";
+        logger.LogWarning("meaningless model answer for request {RequestId}, chain {Chain}", requestId, string.Join(" -> ", chain));
+    }
+    else if (!ok)
     {
         // усі моделі ланцюга впали або їхні запобіжники відкриті. Остання сходинка деградації
         // це ввічлива відповідь і шлях до людини. Текст для людини, а статус для машин.

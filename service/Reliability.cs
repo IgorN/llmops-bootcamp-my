@@ -7,7 +7,8 @@ using System.Text.Json;
 
 // результат одного виклику. Збій це значення, а не виняток, тому ланцюг може спробувати наступну модель.
 // ErrorKind розрізняє, що сталось: status (провайдер відповів 4xx/5xx), timeout, network (відповіді не було),
-// bad_response (відповідь не розпарсилась). Без нього таймаут і розрив зʼєднання в лозі виглядали б однаково.
+// bad_response (відповідь не розпарсилась), garbage (200 і валідний JSON, але змісту немає).
+// Без нього таймаут і розрив зʼєднання в лозі виглядали б однаково.
 public record GatewayResult(
     bool Ok, int Status, string? ErrorKind, string Answer, string? Tool, string ToolArgs,
     int PromptTokens, int CompletionTokens, bool UsageKnown, int LatencyMs);
@@ -59,8 +60,16 @@ public static class Reliability
             }
 
             var usage = doc.RootElement.GetProperty("usage");
-            return new GatewayResult(true, status, null, answer, tool, toolArgs,
-                usage.GetProperty("prompt_tokens").GetInt32(), usage.GetProperty("completion_tokens").GetInt32(), true, Elapsed());
+            var promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
+            var completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+
+            // W5: успішна, але непридатна відповідь це збій формату, а не успіх. Текст без жодної літери
+            // («...», порожньо) користувачу нічого не каже. Токени провайдер однаково порахував, тож usage лишаємо.
+            // Відповідь з інструментом може бути без тексту, її не чіпаємо.
+            if (tool is null && !answer.Any(char.IsLetter))
+                return new GatewayResult(false, status, "garbage", "", null, "{}", promptTokens, completionTokens, true, Elapsed());
+
+            return new GatewayResult(true, status, null, answer, tool, toolArgs, promptTokens, completionTokens, true, Elapsed());
         }
         catch (OperationCanceledException)
         {
