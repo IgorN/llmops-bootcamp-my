@@ -357,6 +357,91 @@ app.MapGet("/observability", async (ILogger<Program> logger) =>
 // бо /observability без бази віддає 503, і db_failure зник би саме тоді, коли він потрібен.
 // Збої ендпоінтів консолі сюди не йдуть. Консоль опитує їх кожні 4 с, і лічильник міряв би опитування, а не клієнтів.
 app.MapGet("/errors", () => Results.Json(new { since = processStartedAt, by_kind = ErrorTaxonomy.Snapshot() }));
+// W6 опційно: ті самі сигнали у форматі Prometheus для зовнішнього дашборда (профіль advanced).
+// Плитки показують лише сьогодні, а Prometheus тримає історію і рахує rate за будь-яке вікно.
+// Тому з бази віддаємо лічильники за весь лог, а не «за сьогодні». Вони лише ростуть,
+// а скидання після down -v Prometheus сам розпізнає як рестарт лічильника.
+// Затримка це гістограма з бакетів, тож p95 рахується за останні 5 хв, а не за весь день.
+// Без бази ендпоінт не падає. Лічильники з памʼяті лишаються, а llmops_db_up = 0 сам стає сигналом.
+app.MapGet("/metrics", async (ILogger<Program> logger) =>
+{
+    var inv = System.Globalization.CultureInfo.InvariantCulture;
+    var sb = new StringBuilder();
+    void Metric(string name, string type, string help)
+    {
+        sb.Append("# HELP ").Append(name).Append(' ').Append(help).Append('\n');
+        sb.Append("# TYPE ").Append(name).Append(' ').Append(type).Append('\n');
+    }
+
+    var dbUp = 1;
+    try
+    {
+        await using var db = new NpgsqlConnection(dbConn);
+        await db.OpenAsync();
+
+        await using (var rows = new NpgsqlCommand(
+            "SELECT source, status, COALESCE(error_kind, ''), count(*), COALESCE(sum(cost_usd), 0), "
+            + "count(*) FILTER (WHERE attempt > 1) FROM requests GROUP BY 1, 2, 3 ORDER BY 1, 2, 3", db))
+        await using (var reader = await rows.ExecuteReaderAsync())
+        {
+            var cost = new SortedDictionary<string, decimal>();
+            long fallbacks = 0;
+            Metric("llmops_log_rows_total", "counter", "Рядки логу requests: виклики моделі, cache-hit і пропуски через запобіжник.");
+            while (await reader.ReadAsync())
+            {
+                var source = reader.GetString(0);
+                sb.Append(inv, $"llmops_log_rows_total{{source=\"{source}\",status=\"{reader.GetString(1)}\",error_kind=\"{reader.GetString(2)}\"}} {reader.GetInt64(3)}\n");
+                cost[source] = cost.GetValueOrDefault(source) + reader.GetDecimal(4);
+                fallbacks += reader.GetInt64(5);
+            }
+            Metric("llmops_cost_usd_total", "counter", "Облікова вартість викликів моделі.");
+            foreach (var (source, usd) in cost) sb.Append(inv, $"llmops_cost_usd_total{{source=\"{source}\"}} {usd}\n");
+            Metric("llmops_fallback_events_total", "counter", "Переходи на наступну модель ланцюга (attempt > 1).");
+            sb.Append(inv, $"llmops_fallback_events_total {fallbacks}\n");
+        }
+
+        int[] bounds = [10, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+        await using (var hist = new NpgsqlCommand(
+            "SELECT " + string.Concat(bounds.Select(b => $"count(*) FILTER (WHERE latency_ms <= {b}), "))
+            + "count(*), COALESCE(sum(latency_ms), 0) FROM requests", db))
+        await using (var reader = await hist.ExecuteReaderAsync())
+        {
+            await reader.ReadAsync();
+            Metric("llmops_latency_ms", "histogram", "Затримка рядків логу в мілісекундах.");
+            for (var i = 0; i < bounds.Length; i++)
+                sb.Append(inv, $"llmops_latency_ms_bucket{{le=\"{bounds[i]}\"}} {reader.GetInt64(i)}\n");
+            sb.Append(inv, $"llmops_latency_ms_bucket{{le=\"+Inf\"}} {reader.GetInt64(bounds.Length)}\n");
+            sb.Append(inv, $"llmops_latency_ms_sum {reader.GetInt64(bounds.Length + 1)}\n");
+            sb.Append(inv, $"llmops_latency_ms_count {reader.GetInt64(bounds.Length)}\n");
+        }
+    }
+    catch (Exception ex)
+    {
+        dbUp = 0;
+        logger.LogError(ex, "failed to read metrics from db");
+    }
+
+    Metric("llmops_db_up", "gauge", "Чи вдалося прочитати лог з бази під час цього scrape.");
+    sb.Append(inv, $"llmops_db_up {dbUp}\n");
+    Metric("llmops_cache_requests_total", "counter", "Звернення повз кеш і влучання, з моменту старту процесу.");
+    sb.Append(inv, $"llmops_cache_requests_total{{result=\"hit\"}} {Interlocked.Read(ref stats.Hits)}\n");
+    sb.Append(inv, $"llmops_cache_requests_total{{result=\"miss\"}} {Interlocked.Read(ref stats.Misses)}\n");
+    Metric("llmops_errors_total", "counter", "Таксономія збоїв, з моменту старту процесу.");
+    foreach (var (kind, n) in ErrorTaxonomy.Snapshot()) sb.Append(inv, $"llmops_errors_total{{kind=\"{kind}\"}} {n}\n");
+
+    var now = DateTimeOffset.UtcNow;
+    Metric("llmops_provider_status", "gauge", "Стан запобіжника моделі, 1 у рядку поточного стану.");
+    foreach (var name in KnownModels(defaultModel))
+    {
+        var status = breakers.TryGetValue(name, out var breaker) ? breaker.Status(now) : "ok";
+        foreach (var s in new[] { "ok", "degraded", "down" })
+            sb.Append(inv, $"llmops_provider_status{{model=\"{name}\",status=\"{s}\"}} {(s == status ? 1 : 0)}\n");
+    }
+    Metric("llmops_approvals_pending", "gauge", "Незворотні дії, що чекають на оператора.");
+    sb.Append(inv, $"llmops_approvals_pending {approvals.Snapshot(now).Count(a => a.Status == "pending")}\n");
+
+    return Results.Text(sb.ToString(), "text/plain; version=0.0.4; charset=utf-8");
+});
 // W2: витрати за сьогодні з БД плюс бюджет. Без БД 503, а не нуль, бо нуль збреше плитці.
 app.MapGet("/cost", async (ILogger<Program> logger) =>
 {

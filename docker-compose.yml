@@ -53,5 +53,29 @@ services:
     profiles: ["advanced"]
     ports: ["6379:6379"]
 
+  # W6 опційно: історія метрик і дашборд поверх /metrics сервісу.
+  # Grafana пускає без логіну лише на перегляд, це локальний стенд.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: ["advanced"]
+    ports: ["9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on: [service]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: ["advanced"]
+    ports: ["3000:3000"]
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/llmops.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+
 volumes:
   pgdata:
