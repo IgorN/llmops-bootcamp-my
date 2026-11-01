@@ -5,8 +5,11 @@ on:
   pull_request:
 
 jobs:
+  # назва job `eval` це і є required check у branch protection. Перейменування job тихо вимкне захист.
   eval:
     runs-on: ubuntu-latest
+    # прогін триває хвилину. Без межі завислий стек тримав би PR до шести годин, і гейт почали б обходити.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +32,8 @@ jobs:
             code=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:4000/v1/chat/completions \
               -H "Content-Type: application/json" \
               -d '{"model":"mock","messages":[{"role":"user","content":"hi"}]}' || true)
-            if [ "$code" = "200" ]; then exit 0; fi
+            # успіх це будь-який 2xx, а не рівно 200
+            case "$code" in 2??) exit 0 ;; esac
             sleep 5
           done
           echo "gateway not ready"
@@ -48,7 +52,18 @@ jobs:
       - name: Evals
         env:
           SERVICE_URL: http://localhost:8080
-        run: python evals/run.py --dataset evals/golden.jsonl --threshold $(sh evals/threshold.sh evals/golden.jsonl)
+        # pipefail обовʼязковий. Без нього exit code береться з tee, і червоний eval дав би зелений крок.
+        run: |
+          set -o pipefail
+          python evals/run.py --dataset evals/golden.jsonl --threshold $(sh evals/threshold.sh evals/golden.jsonl) | tee eval.txt
+
+      # результат кейсів на сторінці прогону, щоб причину падіння було видно без розгортання логів
+      - name: Eval summary
+        if: always()
+        run: |
+          if [ -f eval.txt ]; then
+            { echo '```'; cat eval.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Logs on failure
         if: failure()

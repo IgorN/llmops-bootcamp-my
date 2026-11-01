@@ -1,0 +1,12 @@
+# Prometheus для профілю advanced. Збирає /metrics сервісу кожні 15 с і рахує алерти з alerts.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: llmops-service
+    static_configs:
+      - targets: ["service:8080"]
