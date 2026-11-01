@@ -78,6 +78,6 @@ CREATE INDEX IF NOT EXISTS idx_prompt_activations_at ON prompt_activations (acti
 -- v1 навмисно без слова "support". На ньому mock відповідає «не знаю».
 -- Це потрібно, щоб відтворити регресію і відкат.
 INSERT INTO prompts (name, version, body, active) VALUES
-    ('support-system', 'v1', 'You are an assistant.', false),
-    ('support-system', 'v2', 'You are a support assistant. Be concise and helpful.', true)
+    ('support-system', 'v1', 'You are an assistant.', true),
+    ('support-system', 'v2', 'You are a support assistant. Be concise and helpful.', false)
 ON CONFLICT (name, version) DO NOTHING;
