@@ -117,8 +117,10 @@ HTTP-метрики тут у нормі, тож плитки мовчать. С
 Відтворення. Активуємо «зламану» версію `v1`.
 
 ```bash
-curl -s -X POST localhost:8080/prompts/v1/activate
+curl -s -X POST localhost:8080/prompts/v1/activate -H "X-Actor: $(whoami)"
 ```
+
+`X-Actor` записує в журнал активацій, хто перемкнув версію. Без нього там буде `ip:` з адресою Docker bridge, а вона людину не ідентифікує.
 
 ### 1. Симптом
 
@@ -134,7 +136,7 @@ curl -s localhost:8080/chat -H "Content-Type: application/json" -d '{"message":"
 docker compose exec postgres psql -U llmops -d llmops -c "SELECT version, actor, activated_at FROM prompt_activations ORDER BY id DESC LIMIT 3;" -c "SELECT prompt_version, count(*) FROM requests WHERE created_at > now() - interval '1 hour' GROUP BY 1;"
 ```
 
-Видно, хто і коли перемкнув версію, і що погані відповіді йдуть на новій версії.
+Видно, коли і на яку версію перемкнули, і хто, якщо активацію зробили з `X-Actor`. Рядок `ip:…` означає, що заголовка не було і людину треба шукати інакше. Другий запит показує, що погані відповіді йдуть на новій версії.
 
 ```bash
 SERVICE_URL=http://localhost:8080 python evals/run.py --dataset evals/golden.jsonl --threshold $(sh evals/threshold.sh evals/golden.jsonl)
@@ -145,7 +147,7 @@ SERVICE_URL=http://localhost:8080 python evals/run.py --dataset evals/golden.jso
 ### 3. Дія. Відкат промпта
 
 ```bash
-curl -s -X POST localhost:8080/prompts/v2/activate
+curl -s -X POST localhost:8080/prompts/v2/activate -H "X-Actor: $(whoami)"
 ```
 
 Без деплою, менше хвилини. Застарілих відповідей кеш не віддасть, бо версія промпта входить у ключ кешу.
